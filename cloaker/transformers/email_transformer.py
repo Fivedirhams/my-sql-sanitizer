@@ -1,99 +1,123 @@
-"""Email transformer — generates realistic emails preserving domain distribution."""
+"""Email transformer — deterministic generation, ZERO LLM calls.
+
+Strategy: hash-based realistic name part, preserve domain exactly.
+Each unique input always produces the same output (idempotent).
+Cross-table consistency via GlobalMappingRegistry (merged during transform).
+No file/directory dependencies — fully stateless computation.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Dict, List, Any, Optional
 
 from cloaker.base_transformer import BaseTransformer
 
 
+# ── Deterministic "word" fragments (realistic-looking parts) ──────────
+
+_CONSONANTS = "bcdfghjklmnprstvwxz"
+_VOWELS     = "aeiou"
+
+
 class EmailTransformer(BaseTransformer):
-    """Generate realistic replacement emails maintaining domain patterns.
-    
-    Uses GlobalMappingRegistry for cross-table consistency.
-    Falls back to deterministic generation (not hash) for unseen values.
-    """
+    """Generate deterministic replacement emails. No LLM, no files needed."""
+
+    def __init__(self, config: Any) -> None:
+        super().__init__(config)
+        # Local field-level cache for speed-up within same dump run
+        self._field_cache: Dict[str, Dict[str, str]] = {}
+
+    def type_name(self) -> str:
+        return "email"
+
+    # ── Core transform ────────────────────────────────────────────────
 
     def transform(self, value: Optional[str], table: str, column: str) -> Optional[str]:
         if value is None:
             return value
-        
-        # Ensure mapping is loaded
+
         field_key = f"{table}_{column}"
-        if not self._ensure_loaded(field_key):
-            return value
         
-        # Check direct mapping first (LLM-generated)
-        if value in self._mapping:
-            return self._mapping[value]
+        # Check local cache first (populated by _load_mapping or previous transforms)
+        if field_key in self._field_cache and value in self._field_cache[field_key]:
+            return self._field_cache[field_key][value]
+
+        # Compute deterministic replacement
+        result = self._deterministic(value)
         
-        # Check global cache (value mapped from another table/column)
+        # Store in local cache
+        if field_key not in self._field_cache:
+            self._field_cache[field_key] = {}
+        self._field_cache[field_key][value] = result
+
+        # Merge into global registry for cross-table consistency
         from cloaker.cache import GlobalMappingRegistry
         reg = GlobalMappingRegistry.instance()
-        cached = reg.get_replacement(value)
-        if cached:
-            return cached
-        
-        # Fallback: generate deterministic email preserving domain
-        return self._fallback_email(value)
-    
-    def type_name(self) -> str:
-        return "email"
-    
+        reg.set_mapping(value, result)
+
+        return result
+
+    # ── Mapping pre-computation (for bulk profiling speedup) ───────────
+
     def _load_mapping(
         self,
         samples: List[Dict[str, Any]],
         field_key: str,
         stats: Dict[str, Any],
     ) -> None:
-        from cloaker.llm_client import LLMClient
-        from cloaker.cache import GlobalMappingRegistry
-        client = LLMClient(self.config)
-        reg = GlobalMappingRegistry.instance()
+        """Pre-compute mappings for known samples. Called once during profile phase."""
+        seen_values: set[str] = set()
 
-        unique_values = list(set(s["value"] for s in samples if s.get("value") and "@" in s["value"]))
-        
-        # Extract domain stats
-        domain_stats = {}
         for s in samples:
-            val = s.get("value", "")
-            if "@" in val:
-                domain = val.split("@")[-1]
-                domain_stats[domain] = domain_stats.get(domain, 0) + 1
-        
-        # Filter out values that already have global mappings
-        unseen = [v for v in unique_values if not reg.get_replacement(v)]
-        
-        if unseen:
-            result = client.generate_email_mapping(field_key, unseen, domain_stats)
-            raw_map = result if isinstance(result, dict) else {}
-            reg.merge_mappings(raw_map)
-            self._mapping.update({str(k): str(v) for k, v in raw_map.items()})
-        else:
-            self._mapping = {v: reg.get_replacement(v) for v in unique_values}
-    
+            val = s.get("value", "") or ""
+            if "@" not in val:
+                continue
+            seen_values.add(val)
+
+        # Pre-compute ALL mappings deterministically
+        if field_key not in self._field_cache:
+            self._field_cache[field_key] = {}
+
+        for val in seen_values:
+            self._field_cache[field_key][val] = self._deterministic(val)
+
+        # Push to global registry for cross-table consistency
+        from cloaker.cache import GlobalMappingRegistry
+        reg = GlobalMappingRegistry.instance()
+        reg.merge_mappings(self._field_cache[field_key])
+
+    # ── Deterministic generation ──────────────────────────────────────
+
     @staticmethod
-    def _fallback_email(original_value: str) -> str:
-        """Generate a realistic-looking email as fallback (preserves domain)."""
-        import hashlib
-        
-        # Try to preserve original domain
-        if "@" in original_value:
-            name_part, domain = original_value.rsplit("@", 1)
-        else:
-            name_part = original_value.strip().strip("'\"").lower()
-            domain = "example.com"
-        
-        # Generate random-ish name part
-        h = hashlib.sha256(f"{original_value}".encode()).hexdigest()[:8]
-        clean_words = re.findall(r'[a-z]+', name_part)
-        
-        if len(clean_words) >= 2:
-            new_name = f"{clean_words[0][:4]}{clean_words[-1][:3]}{h[:3]}"
-        elif clean_words:
-            new_name = f"{clean_words[0][:8]}{h[:3]}"
-        else:
-            new_name = f"user{h[:5]}"
-        
+    def _deterministic(email: str) -> str:
+        """Hash-based: keep domain intact, replace name part with realistic token."""
+        if "@" not in email:
+            return f"user{hashlib.sha256(email.encode()).hexdigest()[:8]}@example.com"
+
+        name_part, domain = email.rsplit("@", 1)
+        domain = domain.strip().lower()
+
+        # Build a short realistic name from hash
+        h = hashlib.sha256(email.encode()).hexdigest()
+
+        name_clean = re.sub(r'[^a-zA-Z0-9]', '', name_part).lower()
+
+        # Create 2-3 syllable name like real people
+        syllables = []
+        offset = int(h[:2], 16)
+
+        for i in range(3):
+            ci = (offset + i * 7) % len(_CONSONANTS)
+            vi = (offset + i * 13 + 3) % len(_VOWELS)
+            syllables.append(_CONSONANTS[ci] + _VOWELS[vi])
+
+        new_name = "".join(syllables)
+
+        # Mix in original word fragment for recognisability
+        if name_clean:
+            prefix_len = min(2, len(name_clean))
+            new_name = name_clean[:prefix_len] + new_name[2:]
+
         return f"{new_name}@{domain}"

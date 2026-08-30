@@ -1,0 +1,2 @@
+# No external Python packages needed — stdlib only
+# (json, re, hashlib, datetime, subprocess, pathlib, time, abc)

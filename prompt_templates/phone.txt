@@ -1,0 +1,11 @@
+Replace '{original_phone}' with a realistic phone number in the same country format.
+Return ONLY the new number with no explanations.
+
+Regional examples:
+- Spain (+34): +34-612-345-678 (mobile) or +34-91-123-4567 (landline)
+- Brazil (+55): +55-11-99876-5432 (mobile with area code)
+- USA (+1): +1-212-555-0123 (standard 10-digit format)
+- Russia (+7): +7-495-123-4567 (Moscow area code) or +7-812-987-6543 (St Petersburg)
+- France (+33): +33-6-12-34-56-78 (French formatting)
+
+Important: Preserve the country calling code and national numbering plan!

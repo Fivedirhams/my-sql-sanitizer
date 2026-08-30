@@ -1,0 +1,30 @@
+# Environment variables with SECRETS — NEVER commit!
+.env
+*.env.local
+.env.*.local
+
+# Compiled Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Project outputs
+output/
+profiles/
+sanitized_*.sql
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*~

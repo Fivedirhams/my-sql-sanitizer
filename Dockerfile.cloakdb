@@ -1,0 +1,56 @@
+# =============================================================================
+# CloakDB — Production Docker Image
+# Multi-stage build with pre-configured Kodik Router API key
+# =============================================================================
+# Usage:
+#   # Build with default token (from .env):
+#     docker buildx build -t cloakdb:latest .
+#
+#   # Or override with your own token:
+#     docker buildx build --build-arg KODIK_API_KEY=sk-your-key -t cloakdb:latest .
+#
+#   # Run (mount your SQL dump to /input, get output from /output):
+#     docker run --rm -v ./my_dump.sql:/input/dump.sql -v ./results:/output cloakdb:latest
+# =============================================================================
+
+FROM python:3.11-slim
+
+# ── Build Args ──────────────────────────────────────────────────
+ARG KODIK_API_KEY
+ENV KODIK_API_KEY=${KODIK_API_KEY:-default_key_placeholder}
+
+# ── System Dependencies ─────────────────────────────────────────
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
+
+# ── Application Setup ───────────────────────────────────────────
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+
+# Copy application code
+COPY cloaker/ ./cloaker/
+COPY config.yaml .
+COPY examples/ ./examples/
+COPY prompt_templates/ ./prompt_templates/
+COPY start.sh .
+
+# Create directories
+RUN mkdir -p /app/output /input
+
+# Expose nothing (CLI tool, not a service)
+EXPOSE 8080/tcp
+
+# Set UTF-8 encoding
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONIOENCODING=utf-8
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD python3 -c "import cloaker; print('CloakDB ready')" || exit 1
+
+# Default entrypoint — interactive wizard
+ENTRYPOINT ["python3", "-m", "cloaker"]

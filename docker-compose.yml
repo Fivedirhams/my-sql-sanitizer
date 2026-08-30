@@ -1,0 +1,54 @@
+# =============================================================================
+# CloakDB — Docker Compose Configuration
+# =============================================================================
+#
+# Quick Start:
+#   1. cp .env.example .env  && vim .env  # Add your KODIK_API_KEY
+#   2. docker compose up --build           # Build & run wizard
+#   3. Select dump → review config → run!
+#
+# Batch Mode (no wizard):
+#   docker compose run --rm cloakdb --batch /input/dump.sql -o /output/result.sql
+#
+# Development (hot-reload config):
+#   docker compose up                         # Rebuilds on first run
+# =============================================================================
+
+services:
+  cloakdb:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloakdb
+      args:
+        KODIK_API_KEY: ${KODIK_API_KEY:-}
+    image: cloakdb:latest
+
+    # Interactive wizard by default — or use --batch for CI
+    stdin_open: true
+    tty: true
+
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro       # Config (read-only)
+      - ./output:/app/output                    # Output directory
+      - ./examples:/app/examples:ro             # Example dumps
+      - ./my_dump.sql:/input/dump.sql:ro        # Your custom dump (optional, replace name)
+
+    environment:
+      # Kodik Router API (from .env file)
+      - KODIK_API_KEY=${KODIK_API_KEY:-REDACTED_LEAKED_KEY}
+      - LLM_ENDPOINT=${LLM_ENDPOINT:-https://api.kodikrouter.ru/v1}
+      - LLM_MODEL=${LLM_MODEL:-qwen/qwen3.7-flash}
+      - MAX_TOKENS=${MAX_TOKENS:-4096}
+      - BATCH_SIZE=${BATCH_SIZE:-20}
+
+    # Resource constraints
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    restart: "no"  # CLI tool — stops after completion

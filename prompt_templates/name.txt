@@ -1,0 +1,3 @@
+Replace '{original_value}' with a realistic NAME in the same language and cultural context.
+Return ONLY the new name (no explanations).
+Language examples: Spanish→Spanish, Russian→Russian, French→French, English→English.

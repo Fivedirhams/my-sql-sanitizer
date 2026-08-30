@@ -463,10 +463,10 @@ class SQLProcessor:
         if has_at:
             return "email"
         
-        # Skip known business code columns (INN/KPP/OGRN etc.) — they look like numbers but are identifiers
-        business_code_patterns = ('inn', 'kpp', 'ogrn', 'vat', 'tax_id', 'contract_number')
-        if any(p in col_lower for p in business_code_patterns):
-            return "crm_status"  # Will use deterministic cycle or hash fallback
+        # Business IDs (INN/KPP/OGRN/passport/contracts) — deterministically generate valid replacements
+        business_id_patterns = ('inn', 'kpp', 'ogrn', 'passport', 'contract', 'vat', 'tax_id', 'registration', 'document')
+        if any(p in col_lower for p in business_id_patterns):
+            return "id_guardian"  # Deterministic checksum-preserving generation
         
         # Date detection
         date_re = re.compile(r'^\d{4}[-/]?\d{1,2}[-/]?\d{1,2}')

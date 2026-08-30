@@ -12,6 +12,7 @@ from cloaker.transformers.genre_transformer import GenreTransformer
 from cloaker.transformers.composer_transformer import ComposerTransformer
 from cloaker.transformers.postal_code_transformer import PostalCodeTransformer
 from cloaker.transformers.crm_status_transformer import CRMStatusTransformer
+from cloaker.transformers.id_guardian_transformer import IDGuardianTransformer
 
 TRANSFORMER_MAP = {
     "name": NameTransformer,
@@ -26,6 +27,7 @@ TRANSFORMER_MAP = {
     "composer": ComposerTransformer,
     "postal_code": PostalCodeTransformer,
     "crm_status": CRMStatusTransformer,
+    "id_guardian": IDGuardianTransformer,
 }
 
 

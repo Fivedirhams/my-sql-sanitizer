@@ -138,17 +138,16 @@ class LLMClient:
         item_cost = 80       # Average chars per item in formatted prompt
         return base_overhead + len(items) * item_cost
 
-    def _split_by_budget(self, samples: List[str], max_chars: int = None, max_values_per_chunk: int = 15) -> List[List[str]]:
+    def _split_by_budget(self, samples: List[str], max_chars: int = None, max_values_per_chunk: int = 150) -> List[List[str]]:
         """Split samples into chunks based on both size AND value count limits.
         
-        CRITICAL: Even with 1M context window, max_tokens (output limit) is ~4096.
-        A chunk with 20+ name values easily produces >4K token JSON response,
-        causing finish_reason:"length". We cap at 15 values/chunk to stay safe.
+        With max_tokens=32768 (updated from 4096), we can safely handle ~150 values
+        per API call while leaving ample room for JSON overhead and system prompt.
         
         Args:
             samples: List of unique values to transform
             max_chars: Char budget per chunk (optional, uses estimate_chars default)
-            max_values_per_chunk: Hard cap on values per chunk (default 15)
+            max_values_per_chunk: Hard cap on values per chunk (default 150)
         """
         if not samples:
             return []
@@ -207,10 +206,9 @@ class LLMClient:
         num_chunks = max(1, int(raw_estimate / self.chunk_max_chars) + 1)
         print(f"      🔄 Calling LLM ({len(samples)} values, ~{num_chunks} chunk(s))...")
         
-        # CRITICAL FIX: Never send >15 values per API call even if raw chars are low.
-        # A single JSON response with 20+ key:value pairs easily exceeds max_tokens (~4096),
-        # causing finish_reason:"length" → empty extraction → failed anonymization.
-        SAFE_VALUES_PER_CALL = 15
+        # CRITICAL UPDATE: With max_tokens=32768, we can safely handle ~150 values per call.
+        # This reduces API calls by 10x compared to previous limit of 15 values/call.
+        SAFE_VALUES_PER_CALL = 150
         SAFE_RAW_CHARS = self.chunk_max_chars * 3  # generous buffer for prompt overhead
         
         # Chunk if EITHER condition triggers

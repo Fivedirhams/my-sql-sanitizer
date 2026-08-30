@@ -13,7 +13,7 @@ class LLMConfig:
     api_key: str = ""
     model: str = "qwen/qwen3.7-flash"
     endpoint: str = "https://api.kodikrouter.ru/v1"
-    max_tokens: int = 4096
+    max_tokens: int = 32768  # Increased from 4096 to support ~150 values per API call
 
 
 @dataclass
@@ -110,7 +110,7 @@ def load_config(config_path: str = "config.yaml") -> CloakDBConfig:
     cfg.llm.api_key = os.environ.get("KODIK_API_KEY", "")
     cfg.llm.model = os.environ.get("LLM_MODEL", "qwen/qwen3.7-flash")
     cfg.llm.endpoint = os.environ.get("LLM_ENDPOINT", "https://api.kodikrouter.ru/v1")
-    cfg.llm.max_tokens = int(os.environ.get("LLM_MAX_COMPLETION_TOKENS", "4096"))
+    cfg.llm.max_tokens = int(os.environ.get("LLM_MAX_COMPLETION_TOKENS", "32768"))
 
     # Process settings from env
     cfg.processing.batch_size = int(os.environ.get("BATCH_SIZE", "20"))

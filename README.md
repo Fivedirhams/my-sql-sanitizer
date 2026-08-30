@@ -29,10 +29,14 @@ python3 -m cloaker
 python3 -m cloaker --batch examples/chinook_test.sql -o output/sanitized.sql
 ```
 
-### Docker
+### Docker — полная инструкция
+См. раздел `🐳 Docker — полная инструкция` в конце этого файла.
+
+**Быстрый старт:**
 ```bash
-docker compose up --build              # Интерактивный мастер
-docker compose run --rm cloakdb --batch /input/dump.sql  # Без мастера
+cp .env.example .env && vim .env       # Настройте API ключ
+docker compose up                      # Интерактивный мастер
+docker compose run --rm cloakdb --batch /input/dump.sql   # Batch mode
 ```
 
 ---
@@ -54,11 +58,12 @@ docker compose run --rm cloakdb --batch /input/dump.sql  # Без мастера
 
 Инструмент читает SQL-дамп один раз, извлекает каждое значение и группирует по `Таблица.Поле`. **Ограничений нет**: если в колонке 10 000 уникальных имён артистов, будут собраны все значения. RAM расходуется минимально — текстовые строки в SQL-дампах короткие, даже 10 тысяч значений занимают ~200 КБ.
 
-### Фаза 2: Загрузка маппингов через LLM
+### Фаза 2: Загрузка маппингов (LLM + детерминированные)
 
-Для каждого поля делается вызов к LLM API: собираем уникальные значения → отправляем запросом (с чанкингом при необходимости) → получаем JSON `{оригинал: замена}`. Результат сохраняется в глобальную карту `GlobalMappingRegistry`.
+- **LLM-поля** (`name`, `address`, `company`, `composer`, `title`, `postal_code`): собираем уникальные значения → отправляем запросом с чанкингом → получаем JSON `{оригинал: замена}` → сохраняем в `GlobalMappingRegistry`
+- **Детерминированные поля** (`email`, `phone`, `genre`, `crm_status`, `date_shuffle`, `id_guardian`, `skip`): маппинги вычисляются мгновенно на клиенте через SHA256 или циклический swap — **ни одного сетевого вызова**
 
-**Важно:** для полей «шафл» (`genre`, `crm_status`, `date_shuffle`) и для `skip` (PK/FK, метрики) LLM не вызывается вообще — обработка локальная.
+**Экономия LLM-вызовов:** email и phone теперь обрабатываются локально. Для Chinook (~15K строк) это экономит ~10 API-запросов за один дамп.
 
 ### Фаза 3: Потоковая замена
 
@@ -77,7 +82,8 @@ docker compose run --rm cloakdb --batch /input/dump.sql  # Без мастера
 ```yaml
 transforms:
   Table.Column: type
-  Customer.Email: email          # Почты → LLM-генерация
+  Customer.Email: email          # Почты → SHA256 hash (ZERO LLM)
+  Customer.Phone: phone          # Телефоны → format-preserving (ZERO LLM)
   Artist.Name: name              # Имена музыкантов → LLM реалистичные
   deals.Stage: crm_status        # Статусы сделок → циклическая замена
   Genre.Name: genre              # Жанры → циклическая замена
@@ -117,8 +123,8 @@ transforms:
 | `crm_status_transformer.py` | `crm_status` | Циклический swap статусов | ❌ Нет |
 | `date_transformer.py` | `date_shuffle_month`, `date_shuffle_year` | Математический шифр дат | ❌ Нет |
 | `id_guardian_transformer.py` | `id_guardian` | Генерация ИНН/OGRN/KPP с checksums | ❌ Нет |
-| `email_transformer.py` | `email` | LLM генерация почт | ✅ Да (локальный fallback) |
-| `phone_transformer.py` | `phone` | LLM генерация номеров | ✅ Да (локальный fallback) |
+| `email_transformer.py` | `email` | Детерминированный hash → реалистичное имя, домен сохраняется | ❌ Нет |
+| `phone_transformer.py` | `phone` | Format-preserving замена цифр (последние 3-4), формат скобок/дефисов сохраняется | ❌ Нет |
 | `name_transformer.py` | `name` | LLM реалистичные имена | ✅ Да |
 | `company_transformer.py` | `company` | LLM названия компаний | ✅ Да |
 | `address_transformer.py` | `address` | LLM адреса | ✅ Да |
@@ -204,59 +210,41 @@ Input:  companies.Inn = "7707083893" (ИНН ЮЛ)
 Output: "5925389347" (валидный ИНН с правильной контрольной)
 ```
 
+### `EmailTransformer` (email) — детерминированный, ZERO LLM
+
+Hash-алгоритм (SHA256) генерирует реалистичную локальную часть (`juan@gmail.com` → `juzija@gmail.com`), доменная часть (`@gmail.com`) сохраняется без изменений.
+
+**Алгоритм:**
+1. Извлекаем домен после `@`
+2. Хэшируем полный email → смещение `offset`
+3. Генерируем 2-3 слога из словаря гласных/согласных
+4. Вставляем первые символы оригинального имени для узнаваемости
+
+**Примеры:**
+```
+juan@gmail.com     → juzija@gmail.com
+luis@yahoo.com     → lurobe@yahoo.com
+maria@hotmail.com  → mariba@hotmail.com
+unknown@test.com   → untida@test.com
+```
+
+### `PhoneTransformer` (phone) — format-preserving, ZERO LLM
+
+Заменяет последние 3-4 цифры номера с сохранением полного формата: скобки, дефисы, пробелы, код страны. SHA256 seed + multi-round XOR+rotation.
+
+**Примеры:**
+```
++1 (425) 555-0174    → +1 (423) 346-9221
++7 (495) 123-45-67   → +7 (494) 308-14-29
+(514) 721-4711       → (514) 270-1680
+8-800-555-35-35      → 8-803-614-18-24
+```
+
 ---
 
 ## 2️⃣ LLM-трансформеры (один вызов на колонку, потом O(1))
 
-Каждый из этих трансформеров вызывает LLM API один раз для загрузки маппинга всех уникальных значений колонки. После этого замена происходит по словарю (O(1)). Если LLM недоступен — используется локальный fallback.
-
-### `EmailTransformer` (email)
-
-Генерирует реалистичные замены, сохраняя домен (`@example.com`). Домены берутся из пула оригинальных значений, чтобы сохранить долю каждого домена.
-
-**Где применять:** `Customer.Email`, `Employee.Email`, `contacts.PersonalEmail`
-
-**Формат запроса к LLM (прямой код из `llm_client.py`):**
-```
-SYSTEM PROMPT:
-"You are a professional data anonymization expert. Generate realistic anonymized replacements for each email provided. All output must be valid JSON only, no explanation text."
-
-USER PROMPT:
-Field: {field_key}
-Generate realistic replacement emails preserving domain distribution.
-Return JSON: {"original_email": "new_email", ...}
-Emails: "{email1}", "{email2}", "{email3}"...
-
-Parameters:
-- max_tokens: 4096 (строгий лимит ответа)
-- temperature: 0.3
-- response_format: {"type": "json_object"}
-- chunk_size: максимум 15 email'ов на вызов (чтобы уместиться в 4096 токенов)
-```
-
-### `PhoneTransformer` (phone)
-
-Сохраняет country code (+7, +1...), формат группировки скобок/дефисов. Меняет только номер. LLM даёт реалистичный вариант, fallback — hash-based generation.
-
-**Где применять:** `Customer.Phone`, `Employee.Phone`, `contacts.BusinessPhone`, `Customer.Fax`
-
-**Формат запроса к LLM:**
-```
-USER PROMPT:
-Field: {field_key}
-Replace each phone number with another realistic phone number of the same format.
-Return JSON: {"original_phone": "new_phone", ...}
-Phones:
-- {phone1}
-- {phone2}
-- {phone3}...
-
-Parameters:
-- max_tokens: 4096
-- temperature: 0.3
-- response_format: {"type": "json_object"}
-- chunk_size: максимум 15 номеров на вызов
-```
+Каждый из этих трансформеров вызывает LLM API один раз для загрузки маппинга всех уникальных значений колонки. После этого замена происходит по словарю (O(1)).
 
 ### `NameTransformer` (name)
 
@@ -368,8 +356,8 @@ transforms:
   Customer.LastName: name             # Фамилии → LLM
   Customer.City: genre                # Города → циклический swap (без LLM!)
   Customer.Country: genre             # Страны → циклический swap (без LLM!)
-  Customer.Email: email               # Почты → LLM
-  Customer.Phone: phone               # Телефоны → LLM
+  Customer.Email: email               # Почты → SHA256 (ZERO LLM)
+  Customer.Phone: phone               # Телефоны → format-preserving (ZERO LLM)
   Customer.State: genre               # Штаты → циклический swap
   Genre.Name: genre                   # Жанры → циклический swap (без LLM!)
   MediaType.Name: genre               # Типы медиа → циклический swap
@@ -564,8 +552,8 @@ my-sql-sanitizer/
 │       ├── date_transformer.py           ← Шаффл дат (без LLM)
 │       ├── id_guardian_transformer.py    ← ИНН/OGRN/паспорта с checksum (NEW)
 │       ├── name_transformer.py           ← Имена (LLM)
-│       ├── email_transformer.py          ← Почты (LLM)
-│       ├── phone_transformer.py          ← Телефоны (LLM)
+│       ├── email_transformer.py          ← Почты (SHA256, ZERO LLM)
+│       ├── phone_transformer.py          ← Телефоны (format-preserving, ZERO LLM)
 │       ├── address_transformer.py        ← Адреса (LLM)
 │       ├── company_transformer.py        ← Компании (LLM)
 │       ├── composer_transformer.py       ← Композиторы (LLM)
@@ -581,6 +569,97 @@ my-sql-sanitizer/
 ├── .env.example                          ← Шаблон переменных окружения
 ├── requirements.txt                      ← Python зависимости
 └── README.md                             ← Этот файл
+```
+
+---
+
+## 🐳 Docker — полная инструкция
+
+### Предварительные требования
+- Docker ≥ 20.10 и Docker Compose ≥ 2.0
+- API ключ Kodik Router (получите на https://api.kodikrouter.ru)
+
+### Шаг 1: Настройка окружения
+
+```bash
+# Скопируйте шаблон .env
+cp .env.example .env
+
+# Отредактируйте с вашим API ключом
+vim .env
+```
+
+Содержимое `.env`:
+```ini
+LLM_API_KEY=sk-your-key-here
+LLM_ENDPOINT=https://api.kodikrouter.ru/v1
+LLM_MODEL=qwen/qwen3.7-flash
+MAX_TOKENS=4096
+BATCH_SIZE=20
+```
+
+### Шаг 2: Сборка образа
+
+**Вариант A — через docker-compose (рекомендуется):**
+```bash
+docker compose build
+```
+
+**Вариант B — ручная сборка:**
+```bash
+# Ключ подставляется через --build-arg
+LLM_KEY=$(cat .env | grep 'LLM_API_KEY=' | cut -d= -f2)
+
+docker buildx build \
+  --build-arg LLM_API_KEY="$LLM_KEY" \
+  --build-arg LLM_ENDPOINT=https://api.kodikrouter.ru/v1 \
+  --build-arg LLM_MODEL=qwen/qwen3.7-flash \
+  --build-arg MAX_TOKENS=4096 \
+  -t cloakdb:latest .
+```
+
+### Шаг 3: Запуск
+
+#### Интерактивный мастер (выбор БД, проверка конфига)
+```bash
+docker compose up
+```
+Мастер пройдёт по 4 этапам:
+1. Выбор SQL дампа из `examples/`
+2. Сбор ВСЕХ уникальных значений каждого поля
+3. Проверка автоклассификации + маппинг к трансформерам
+4. Запуск обработки с индикатором прогресса
+
+Результат сохранится в `output/`
+
+#### Пакетный режим (для CI/CD)
+```bash
+# Сопутствующий файл mount'ен как /input/dump.sql
+docker compose run --rm cloakdb --batch /input/dump.sql -o /output/result.sql
+```
+
+#### Запуск без мастера (минимальный контейнер)
+```bash
+docker run --rm \
+  -v $(pwd)/examples:/data \
+  -v $(pwd)/output:/output \
+  -e LLM_API_KEY=$(cat .env | grep 'LLM_API_KEY=' | cut -d= -f2) \
+  cloakdb:latest --batch /data/chinook_test.sql -o /output/sanitized.sql
+```
+
+### Структура volume mount'ов внутри контейнера
+| Host path        | Container path | Назначение |
+|------------------|---------------|------------|
+| `./config.yaml`  | `/app/config.yaml` | Маппинг полей |
+| `./examples/`    | `/app/examples/` | Исходные дампы |
+| `./output/`      | `/app/output/` | Результаты + профили |
+| `./.env`         | ENV vars | Переменные окружения |
+
+### Очистка
+```bash
+docker compose down
+docker image rm cloakdb:latest   # Если нужно удалить образ
+rm -rf output/profiles/ output/global_mapping.json
 ```
 
 ---

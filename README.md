@@ -60,10 +60,10 @@ docker compose run --rm cloakdb --batch /input/dump.sql   # Batch mode
 
 ### Фаза 2: Загрузка маппингов (LLM + детерминированные)
 
-- **LLM-поля** (`name`, `address`, `company`, `composer`, `title`, `postal_code`): собираем уникальные значения → отправляем запросом с чанкингом → получаем JSON `{оригинал: замена}` → сохраняем в `GlobalMappingRegistry`
-- **Детерминированные поля** (`email`, `phone`, `genre`, `crm_status`, `date_shuffle`, `id_guardian`, `skip`): маппинги вычисляются мгновенно на клиенте через SHA256 или циклический swap — **ни одного сетевого вызова**
+- **LLM-поля** (`name`, `address`, `company`, `composer`, `title`): собираем уникальные значения → отправляем запросом с чанкингом → получаем JSON `{оригинал: замена}` → сохраняем в `GlobalMappingRegistry`
+- **Детерминированные поля** (`email`, `phone`, `postal_code`, `genre`, `crm_status`, `date_shuffle`, `id_guardian`, `skip`): маппинги вычисляются мгновенно на клиенте через SHA256 или циклический swap — **ни одного сетевого вызова**
 
-**Экономия LLM-вызовов:** email и phone теперь обрабатываются локально. Для Chinook (~15K строк) это экономит ~10 API-запросов за один дамп.
+**Экономия LLM-вызовов:** email, phone и postal_code теперь обрабатываются локально. Для Chinook (~15K строк) это экономит ~12 API-запросов за один дамп.
 
 ### Фаза 3: Потоковая замена
 
@@ -130,7 +130,7 @@ transforms:
 | `address_transformer.py` | `address` | LLM адреса | ✅ Да |
 | `composer_transformer.py` | `composer` | LLM композиторы | ✅ Да |
 | `title_transformer.py` | `title` | LLM должности | ✅ Да |
-| `postal_code_transformer.py` | `postal_code` | LLM почтовые коды | ✅ Да |
+| `postal_code_transformer.py` | `postal_code` | SHA256 hash, формат сохраняется (пробелы/дефисы) | ❌ Нет |
 | *(нет)* | `skip` | Пропустить без изменений | ❌ Нет |
 
 ---
@@ -240,6 +240,23 @@ unknown@test.com   → untida@test.com
 8-800-555-35-35      → 8-803-614-18-24
 ```
 
+### `PostalCodeTransformer` (postal_code) — детерминированный, ZERO LLM
+
+Hash-алгоритм (SHA256) генерирует замену, сохраняя формат почтового индекса: длину, разделители (пробелы, дефисы, скобки), регистр букв.
+
+**Поддерживаемые форматы:**
+- US ZIP:        98004 → 41597,  98004-1234 → 27990-7785
+- Российский:     123456 → 000912
+- UK:            SW1A 1AA → HJ0W 0RK
+- Canadian:       K1A 0B1 → Y4S 1R9
+
+**Алгоритм:** заменяет каждый алфанумерический символ на hash-derived альтернативу, сохраняя позицию разделителей.
+
+| Где применять | Примеры полей |
+|---------------|---------------|
+| Почтовые индексы | `Customer.PostalCode`, `BillingAddress.PostalCode` |
+| Индексы адресов | `Employee.ZipCode`, `contracts.MailZip` |
+
 ---
 
 ## 2️⃣ LLM-трансформеры (один вызов на колонку, потом O(1))
@@ -325,22 +342,6 @@ Return JSON: {"original_title": "new_title", ...}
 Titles: "{title1}", "{title2}", "{title3}"...
 ```
 
-### `PostalCodeTransformer` (postal_code)
-
-Почтовые коды с сохранением формата (XXX-XX или XXXXX).
-
-**Формат запроса к LLM:**
-```
-USER PROMPT:
-Field: {field_key}
-Replace each postal code with another valid postal code of the same format.
-Return JSON: {"original": "new", ...}
-Codes:
-- "{code1}"
-- "{code2}"
-- "{code3}"...
-```
-
 ---
 
 ## ⚙️ Конфигурация
@@ -361,6 +362,7 @@ transforms:
   Customer.State: genre               # Штаты → циклический swap
   Genre.Name: genre                   # Жанры → циклический swap (без LLM!)
   MediaType.Name: genre               # Типы медиа → циклический swap
+  BillingAddress.PostalCode: postal_code  # Почтовые индексы → SHA256 (ZERO LLM)
   Album.Title: title                  # Названия альбомов → LLM
   Track.Name: name                    # Названия треков → LLM
   Invoice.InvoiceDate: date_shuffle   # Даты счетов → shuffle дат
@@ -558,7 +560,7 @@ my-sql-sanitizer/
 │       ├── company_transformer.py        ← Компании (LLM)
 │       ├── composer_transformer.py       ← Композиторы (LLM)
 │       ├── title_transformer.py          ← Должности (LLM)
-│       └── postal_code_transformer.py    ← Почтовые коды (LLM)
+│       └── postal_code_transformer.py    ← Почтовые коды (SHA256, ZERO LLM)
 ├── config.yaml                           ← Маппинг полей к трансформерам
 ├── examples/                             ← Тестовые SQL дампы
 │   ├── chinook_test.sql                  ← Музыкальный магазин (11 табл.)

@@ -361,15 +361,23 @@ class SQLProcessor:
     
     @staticmethod
     def _is_skip_column(column: str) -> bool:
-        """Check if column should be skipped (PK/FK pattern or numeric-only)."""
-        if column.endswith('_id') or column.endswith('Id'):
-            return True
-        if column.lower() in ('id', 'pk'):
+        """Check if column should be skipped (PK/FK pattern or numeric-only).
+        
+        Handles ALL capitalization variants: CustomerId, ContactID, DealId, track_id...
+        """
+        col_lower = column.lower()
+        
+        # PK/FK ending: *_id, *Id, *ID (all case combos)
+        if col_lower.endswith('_id') or col_lower.endswith('id'):
             return True
         
-        # Skip FK columns that don't end with _id (like ReportsTo)
+        # Standalone ID / PK
+        if col_lower in ('id', 'pk'):
+            return True
+        
+        # Known FK patterns (no _id suffix but still foreign keys)
         fk_patterns = ('reportsto', 'managerid', 'repid')
-        if column.lower() in fk_patterns:
+        if col_lower in fk_patterns:
             return True
         
         # Skip numeric/measure columns using exact match or substring
@@ -446,57 +454,135 @@ class SQLProcessor:
     def _auto_select_transformer(
         self, column: str, table: str, samples: list
     ) -> str:
-        """Auto-select transformer type based on column name and value patterns."""
+        """Auto-select transformer type based on column name and value patterns.
+        
+        Order matters: named-pattern checks first (email, dates, phone, geo),
+        THEN numeric check. This ensures postal codes and dates aren't skipped
+        as "just numbers" when they belong to specific categories.
+        """
         col_lower = column.lower()
         n_samples = len(samples)
         
-        # Skip numeric-only columns early (prices, quantities, bytes, etc.)
-        all_numeric = all(
-            re.match(r'^[\d.,\-+]+$', s.get("value", "")) 
-            for s in samples if s.get("value")
-        ) if n_samples > 0 else False
-        if all_numeric:
-            return "skip"
+        # ═══ PHASE A: Pattern-matched types (checked by VALUE content) ═══
         
-        # Email detection
+        # 1. Email — '@' character
         has_at = any('@' in s.get("value", "") for s in samples)
         if has_at:
             return "email"
         
-        # Business IDs (INN/KPP/OGRN/passport/contracts) — deterministically generate valid replacements
+        # 2. Business IDs — deterministic checksum generation (INN/KPP/OGRN/passport)
         business_id_patterns = ('inn', 'kpp', 'ogrn', 'passport', 'contract', 'vat', 'tax_id', 'registration', 'document')
         if any(p in col_lower for p in business_id_patterns):
-            return "id_guardian"  # Deterministic checksum-preserving generation
+            return "id_guardian"
         
-        # Date detection
-        date_re = re.compile(r'^\d{4}[-/]?\d{1,2}[-/]?\d{1,2}')
-        dates_found = sum(
-            1 for s in samples if date_re.match(s.get("value", ""))
-        )
+        # 3. Dates — YYYY-MM-DD / YYYY/MM/DD (with separators) OR YYYYMMDD (exactly 8 digits)
+        # Strict mode prevents false positives on long numeric IDs like '3570236' (bytes)
+        date_re_with_sep = re.compile(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}')
+        date_re_exact = re.compile(r'^\d{8}$')  # Only pure 8-digit numbers (no separators)
+        def _is_date(sample):
+            val = sample.get("value", "")
+            if date_re_with_sep.match(val):
+                return True
+            # For unseparated dates, require exactly 8 digits (not 7, not 9)
+            if date_re_exact.match(val) and len(val) == 8:
+                return True
+            return False
+        dates_found = sum(1 for s in samples if _is_date(s))
         if dates_found > n_samples * 0.7:
             has_time = any(':' in s.get("value", "") for s in samples)
             scope = "_month" if has_time else "_year"
             return f"date_shuffle{scope}"
         
-        # Phone detection
-        phone_re = re.compile(r'^[\d\+\-\(\)\s.]+$')
+        # 4. Phones — must have PHONE-SPECIFIC formatting signs
+        # Acceptable patterns: +1 (...) | (+7) ... | 8-... | (495) ... | ...-..-..
+        # REJECT: plain digit strings like '3570236' (could be bytes, ms, id, etc.)
+        phone_format_patterns = [
+            r'\+\d',           # +7, +1, +44...
+            r'\(\d{2,4}\)',    # (425), (+7), (495)... 
+            r'^8-\d',           # 8-916-...
+            r'\d{2,4}[\- ]\d', # 495-123, 495 123...
+            r'\d{4}-\d{2}',     # 1234-56 (Russian internal format)
+        ]
         phone_count = sum(
-            1 for s in samples 
-            if phone_re.match(s.get("value", "")) and len(re.sub(r'\D', '', s.get("value", ""))) >= 7
+            1 for s in samples
+            if any(p.search(s.get("value", "")) for p in map(re.compile, phone_format_patterns))
+            and len(re.sub(r'\D', '', s.get("value", ""))) >= 7
         )
         if phone_count > n_samples * 0.5:
             return "phone"
         
-        # City/state/country/postalcode/town — deterministic cyclic swap (no LLM!)
-        if col_lower in ('city', 'state', 'country', 'postalcode', 'postal_code',
-                          'billing_city', 'preferred_city', 'address_city', 'town'):
-            return "genre"  # Cyclic swap, no API needed
+        # 5. Geo fields — city, state, country, postal code (SUBSTRING match)
+        # Postal codes ARE numeric but must be genre-swapped, NOT skipped.
+        geo_patterns = ('city', 'state', 'country', 'postalcode', 'postal_code', 'town')
+        if any(p in col_lower for p in geo_patterns):
+            return "genre"
         
-        # Address fields (including legal_address) — use address transformer
+        # ═══ PHASE B: Column-name-only types (value-insensitive) ═══
+        
+        # 6. Company (BEFORE name! — 'CompanyName' must not match on 'name')
+        if 'company' in col_lower:
+            return "company"
+        
+        # 7. Composer — musical composer names
+        if 'composer' in col_lower:
+            return "composer"
+        
+        # 8. Name — First/Last/Middle names
+        # After 'company' check so CompanyName doesn't get misclassified
+        if any(p in col_lower for p in ('name', 'firstname', 'lastname', 'first_name', 'last_name')):
+            return "name"
+        
+        # 9. Title / Job title
+        if col_lower == 'title':
+            return "title"
+        
+        # 10. Address (incl. legal_address)
         if 'address' in col_lower or 'legal' in col_lower:
             return "address"
         
-        # Name-like columns
+        # ═══ PHASE C: Enum & categorical types ═══
+        
+        # 11. Genre/media-type/category/type
+        if any(p in col_lower for p in ('genre', 'media_type', 'playlist', 'type', 'category')):
+            return "genre"
+        
+        # 12. Industry/sector/classification
+        if 'industry' in col_lower or 'sector' in col_lower or 'classification' in col_lower:
+            return "genre"
+        
+        # 13. Currency codes (USD, EUR, RUB — very few unique values)
+        if 'currency' in col_lower or col_lower in ('code', 'iso_code'):
+            return "genre"
+        
+        # 14. CRM status/stage/terms/method/payment_type
+        if any(p in col_lower for p in ('status', 'stage', 'terms', 'method', 'payment_type')):
+            return "crm_status"
+        
+        # 15. Lead source / marketing channel
+        if any(p in col_lower for p in ('leadsource', 'lead_source', 'marketing', 'campaign', 'referral')):
+            return "crm_status"
+        
+        # ═══ PHASE D: Skip decisions ═══
+        
+        # 16. Numeric columns — prices, quantities, bytes, milliseconds (LAST resort)
+        # By this point, dates/phones/postal codes already handled above.
+        all_numeric = all(
+            re.match(r'^[\d.,\-+]+$', s.get("value", ""))
+            for s in samples if s.get("value")
+        ) if n_samples > 0 else False
+        if all_numeric:
+            return "skip"
+        
+        # 17. Free-text fields — too variable, skip per-row anonymization
+        if any(p in col_lower for p in ('notes', 'description', 'comment', 'memo', 'biography')):
+            return "skip"
+        
+        # 18. URL/Website — free-form URLs
+        if 'website' in col_lower or 'url' in col_lower or 'domain' in col_lower:
+            return "skip"
+        
+        # Default: cycle-safe genre swap
+        return "genre"
         if any(p in col_lower for p in ('name', 'firstname', 'lastname', 'first_name', 'last_name')):
             return "name"
         
@@ -508,26 +594,37 @@ class SQLProcessor:
         if col_lower == 'title':
             return "title"
         
-        # Company/industry
+        # Company
         if 'company' in col_lower:
             return "company"
         
-        # Address
-        if 'address' in col_lower:
-            return "address"
+        # Industry/sector/classification — categorical enum
+        if 'industry' in col_lower or 'sector' in col_lower or 'classification' in col_lower:
+            return "genre"  # Cyclic swap
+        
+        # Currency/monetary codes — small enum set
+        if 'currency' in col_lower or col_lower in ('code', 'iso_code'):
+            return "genre"  # Cyclic swap (USD, EUR, RUB — only few unique values)
+        
+        # LeadSource / marketing_source — business enum
+        if any(p in col_lower for p in ('leadsource', 'lead_source', 'marketing', 'campaign', 'referral')):
+            return "crm_status"  # Cyclic swap
+        
+        # Website/URL — contains domain which has emails
+        if 'website' in col_lower or 'url' in col_lower or 'domain' in col_lower:
+            return "skip"  # Free-text URL, hard to anonymize meaningfully
+        
+        # Notes/description/free-text — skip (too variable for per-row anonymization)
+        if any(p in col_lower for p in ('notes', 'description', 'comment', 'memo', 'biography')):
+            return "skip"
         
         # Genre/media-type/category/type
         if any(p in col_lower for p in ('genre', 'media_type', 'playlist', 'type', 'category')):
             return "genre"
         
-        # CRM status/stage/lead source — enum-like multi-word values
-        if any(p in col_lower for p in ('status', 'stage', 'lead_source', 'terms', 'method')):
-            has_enum = n_samples > 0 and all(
-                ' ' not in s.get("value", "").strip() and len(s.get("value", "")) < 20
-                for s in samples
-            )
-            if has_enum or col_lower.endswith('_id') is False:
-                return "crm_status"
+        # CRM status/stage/terms/method — enum-like fields
+        if any(p in col_lower for p in ('status', 'stage', 'terms', 'method', 'payment_type')):
+            return "crm_status"  # Cyclic swap
         
         # Default fallback
         return "genre"

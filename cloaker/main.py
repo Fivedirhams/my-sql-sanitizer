@@ -736,34 +736,45 @@ class SQLProcessor:
                 tx_map = table_tx.get(table, {})
                 transformer = tx_map.get(column)
                 
+                raw = val.strip()
+                
+                # Extract the actual data value from SQL representation
+                if raw.startswith("N'"):
+                    inner = raw[2:]  # strip N prefix
+                elif raw.startswith("'"):
+                    inner = raw[1:]
+                else:
+                    inner = raw
+                
+                # Strip surrounding quotes
+                data = inner.strip(chr(39) + chr(34))
+                # Unescape doubled quotes 
+                data = data.replace("''", "'")
+                
+                replacement = None
+                
+                # Try mapping lookup first (LLM-based transformers)
                 if transformer and transformer._mapping:
-                    raw = val.strip()
-                    
-                    # Extract the actual data value from SQL representation
-                    if raw.startswith("N'"):
-                        inner = raw[2:]  # strip N prefix
-                    elif raw.startswith("'"):
-                        inner = raw[1:]
-                    else:
-                        inner = raw
-                    
-                    # Strip surrounding quotes
-                    data = inner.strip(chr(39) + chr(34))
-                    # Unescape doubled quotes 
-                    data = data.replace("''", "'")
-                    
                     replacement = transformer._mapping.get(data)
+                
+                # Fallback: use transform() method for stateless transformers
+                # (IDGuardian, Phone, Email without LLM cache, etc.)
+                if replacement is None and transformer and hasattr(transformer, 'transform'):
+                    try:
+                        replacement = transformer.transform(data, table=table, column=column)
+                    except Exception:
+                        pass  # Transform failed — will preserve original
+                
+                if replacement is not None:
+                    # Detect original quote style
+                    prefix = "N'" if raw.startswith("N'") else "'" if raw.startswith("'") else ""
                     
-                    if replacement is not None:
-                        # Detect original quote style
-                        prefix = "N'" if raw.startswith("N'") else "'" if raw.startswith("'") else ""
-                        
-                        if prefix:
-                            safe = replacement.replace("'", "''")
-                            new_vals.append(prefix + safe + "'")
-                        else:
-                            new_vals.append(replacement)
-                        continue
+                    if prefix:
+                        safe = replacement.replace("'", "''")
+                        new_vals.append(prefix + safe + "'")
+                    else:
+                        new_vals.append(replacement)
+                    continue
                 
                 # No transformation — preserve original
                 new_vals.append(self._safe_sql_val(val))

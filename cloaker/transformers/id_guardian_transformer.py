@@ -9,18 +9,33 @@ Uses modular arithmetic, NOT LLM — perfect checksum validation required.
 
 from __future__ import annotations
 
+import random as r
 import re
 from typing import Dict, List, Any
 
+from ..base_transformer import BaseTransformer
 
-class IDGuardianTransformer:
-    """Deterministic replacement for business IDs with checksum validation."""
 
+class IDGuardianTransformer(BaseTransformer):
+    """Deterministic replacement for business IDs with checksum validation.
+    
+    Inherits from BaseTransformer but uses stateless generation instead of LLM mappings.
+    The _load_mapping is overridden to be a no-op since we generate deterministically.
+    """
+    
     type_name = "id_guardian"
     
     def __init__(self, config=None):
-        self._mapping = {}
-        self.config = config
+        super().__init__(config)
+    
+    def _load_mapping(self, samples: List[Dict[str, Any]], field_key: str, stats: Dict[str, Any] = None) -> None:
+        """Override: ID Guardian is stateless — no LLM mapping needed.
+        
+        This method is called by main.py to load LLM mappings, but
+        ID Guardian generates replacements deterministically on-the-fly,
+        so we just skip loading and mark as loaded.
+        """
+        self._loaded = True  # Ready to transform without any pre-loading
     
     @staticmethod
     def calculate_inn_checksum(inn_base: str, weights: list) -> int:

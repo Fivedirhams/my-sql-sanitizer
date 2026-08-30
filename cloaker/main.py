@@ -78,20 +78,21 @@ class SQLProcessor:
     # ── Phase 1: Sample collection ─────────────────────────────────────
     
     def _collect_samples(self, sql_path: str) -> Dict[str, list]:
-        """First pass: read dump, collect unique values per table+column.
+        """First pass: read dump, collect ALL unique values per table+column.
         
         Chinook format example:
           INSERT INTO `Artist` (`ArtistId`, `Name`) VALUES
               (1, N'AC/DC'),
-              
+              (2, N'Aerosmith'),
+        
         Strategy: extract table+columns from INSERT header, then process
         value tuples on ALL subsequent lines until next INSERT/DDL.
         
-        Max samples per field set high (500) to capture most unique values
-        while preventing excessive LLM API calls on massive cardinality columns.
+        NO SAMPLE LIMIT: we collect EVERY unique value per column so that
+        LLM gets complete context. Strings in SQL dumps are short (names, cities,
+        emails etc.), even 10k uniques = ~200KB RAM — negligible.
         """
-        # Read limit from config to match config.yaml max_samples_per_field
-        limit = self.config.processing.sample_limit if hasattr(self.config.processing, 'sample_limit') else 50
+
         
         samples: Dict[str, list] = {}
         seen: Dict[str, set] = {}
@@ -186,7 +187,7 @@ class SQLProcessor:
                             seen[col_key] = set()
                             samples[col_key] = []
                         
-                        if clean_val not in seen[col_key] and len(samples[col_key]) < limit:
+                        if clean_val not in seen[col_key]:
                             seen[col_key].add(clean_val)
                             samples[col_key].append({"value": clean_val})
         

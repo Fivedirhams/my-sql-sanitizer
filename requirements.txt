@@ -1,2 +1,4 @@
-# No external Python packages needed — stdlib only
-# (json, re, hashlib, datetime, subprocess, pathlib, time, abc)
+# CloakDB dependencies
+# Core logic is stdlib-only (json, re, hashlib, datetime, subprocess, pathlib, time, random).
+# rich is required for the interactive CLI wizard (cloaker/__main__.py).
+rich>=13.0.0

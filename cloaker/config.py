@@ -11,8 +11,8 @@ from typing import Dict, Any
 @dataclass
 class LLMConfig:
     api_key: str = ""
-    model: str = "qwen/qwen3.7-flash"
-    endpoint: str = "https://api.kodikrouter.ru/v1"
+    model: str = "bailian/qwen3.8-flash"
+    endpoint: str = "https://api.ofox.ai/v1"
     max_tokens: int = 32768  # Increased from 4096 to support ~150 values per API call
 
 
@@ -106,10 +106,10 @@ def load_config(config_path: str = "config.yaml") -> CloakDBConfig:
 
     cfg = CloakDBConfig()
 
-    # Load LLM settings from env
-    cfg.llm.api_key = os.environ.get("KODIK_API_KEY", "")
-    cfg.llm.model = os.environ.get("LLM_MODEL", "qwen/qwen3.7-flash")
-    cfg.llm.endpoint = os.environ.get("LLM_ENDPOINT", "https://api.kodikrouter.ru/v1")
+    # Load LLM settings from env (provider-neutral: LLM_API_KEY preferred, KODIK_API_KEY as legacy fallback)
+    cfg.llm.api_key = os.environ.get("LLM_API_KEY") or os.environ.get("KODIK_API_KEY", "")
+    cfg.llm.model = os.environ.get("LLM_MODEL", "bailian/qwen3.8-flash")
+    cfg.llm.endpoint = os.environ.get("LLM_ENDPOINT", "https://api.ofox.ai/v1")
     cfg.llm.max_tokens = int(os.environ.get("LLM_MAX_COMPLETION_TOKENS", "32768"))
 
     # Process settings from env

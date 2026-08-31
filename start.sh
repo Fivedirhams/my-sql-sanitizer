@@ -11,8 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ── Проверка API ключа ────────────────────────────────────────
-if [[ ! -f ".env" ]] || ! grep -q "KODIK_API_KEY=" .env; then
-    echo "⚠️  ERROR: KODIK_API_KEY not configured!"
+if [[ ! -f ".env" ]] || ! grep -qE "^(LLM_API_KEY|KODIK_API_KEY)=" .env; then
+    echo "⚠️  ERROR: LLM API key not configured (LLM_API_KEY или KODIK_API_KEY)!"
     echo "Run: cp .env.example .env && vim .env"
     exit 1
 fi

@@ -15,6 +15,14 @@
 
 FROM python:3.11-slim
 
+# ── UTF-8 locale (fixes UnicodeDecodeError in the interactive wizard) ──
+# python:3.11-slim ships with the C/POSIX locale; without this, rich's
+# Confirm.ask()/Prompt.ask() can crash reading Cyrillic input from a TTY.
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUTF8=1 \
+    PYTHONIOENCODING=utf-8
+
 # ── Build Args ──────────────────────────────────────────────────
 ARG KODIK_API_KEY
 ENV KODIK_API_KEY=${KODIK_API_KEY:-default_key_placeholder}
@@ -36,7 +44,6 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 COPY cloaker/ ./cloaker/
 COPY config.yaml .
 COPY examples/ ./examples/
-COPY prompt_templates/ ./prompt_templates/
 COPY start.sh .
 
 # Create directories

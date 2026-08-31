@@ -309,8 +309,28 @@ def print_header() -> None:
 
 
 # ── CLI Parser ──────────────────────────────────────────────────
+def _force_utf8_stdio() -> None:
+    """Guarantee UTF-8 I/O so the wizard never crashes on non-ASCII input.
+
+    In a slim container the process locale may be C/POSIX, which makes
+    sys.stdin decode incoming bytes with a non-UTF-8 codec and raise
+    UnicodeDecodeError on Cyrillic prompts. Reconfiguring the streams to
+    UTF-8 with a tolerant error handler makes input() robust regardless.
+    """
+    for name, errors in (("stdin", "ignore"), ("stdout", "replace"), ("stderr", "replace")):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors=errors)
+            except (ValueError, OSError, AttributeError):
+                pass
+
+
 def main() -> None:
     import argparse
+
+    _force_utf8_stdio()
 
     parser = argparse.ArgumentParser(
         prog="cloakdb",

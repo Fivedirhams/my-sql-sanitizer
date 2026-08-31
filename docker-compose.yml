@@ -40,6 +40,11 @@ services:
       - LLM_MODEL=${LLM_MODEL:-qwen/qwen3.7-flash}
       - MAX_TOKENS=${MAX_TOKENS:-32768}
       - BATCH_SIZE=${BATCH_SIZE:-20}
+      # UTF-8 locale so the interactive wizard reads Cyrillic without crashing
+      - LANG=C.UTF-8
+      - LC_ALL=C.UTF-8
+      - PYTHONUTF8=1
+      - PYTHONIOENCODING=utf-8
 
     # Resource constraints
     deploy:

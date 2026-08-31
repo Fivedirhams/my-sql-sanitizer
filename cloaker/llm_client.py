@@ -22,22 +22,16 @@ class LLMTimeoutError(RuntimeError):
 
 # ── Сохранение формата: инструкция модели и отбраковка ответа ───────────────
 
-FORMAT_RULES = """HARD FORMAT RULES — every replacement you emit must match the format
-of its original. These rules outrank «make it look realistic».
-1. Same character count as the original. Free text (names, titles): ±10% is
-   acceptable; anything with digits or separators must be EXACTLY the same length.
-2. Same alphabet: Cyrillic in → Cyrillic out, Latin in → Latin out. Transliterating
-   «Иван» into «Ivan» is a failure, not an anonymization.
-3. Same separators at the same positions: digits stay digits, letters stay letters,
-   spaces, dots, dashes, slashes and brackets stay where they were.
-4. Case pattern is preserved («Иван Петров» → both words capitalized, «J. R. Smith»
-   keeps the single letters and the dots).
-5. Emails: keep the domain byte-for-byte (with its case), change only the local part.
-6. Dates keep their template: '2024-01-15' stays 10 chars with dashes and no time
-   part; '15.03.2021' stays day-first with dots.
-7. Never output NULL, an empty string, a placeholder like 'N/A', '<anonymized>',
-   '***', and never echo the original value back.
-Output only a JSON object {"original": "replacement"}; copy every key exactly."""
+FORMAT_RULES = """IMPORTANT FORMATTING RULES — follow these to avoid rejection:
+1. LENGTH: Free text (names, titles) — keep similar length (±30% OK). 
+   Code/phone/email/dates — EXACTLY same length.
+2. ALPHABET: If input is Cyrillic, output Cyrillic. If Latin, output Latin.
+   (Exception: names can transliterate, but not codes/emails/phones)
+3. SEPARATORS: Keep digits, letters, spaces, dots, dashes in same positions.
+4. CASE: Preserve capitalization pattern (each word capitalized stays capitalized).
+5. DOMAIN: For emails — keep domain exactly the same, change only local part.
+6. PLACEHOLDERS: Never output NULL, empty string, 'N/A', '<anonymized>', '***'.
+7. OUTPUT: Valid JSON only: {"original": "replacement", ...}"""
 
 DATE_LIKE_RE = re.compile(r'^\d{2,4}[-/.]\d{1,2}[-/.]\d{1,2}')
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
@@ -718,9 +712,14 @@ Description: {description}
 Original values ({len(chunk_samples)} total):
 {sample_str}
 
-Replace each value with a realistic alternative for this type of data.
+Replace each value with a realistic alternative. Keep similar length (±30%).
 Return JSON: {{"original": "replacement", ...}}"""
-            return prompt, ""
+            system_prompt = (
+                "You are a data anonymization expert. "
+                "Preserve the same alphabet and case pattern. "
+                "Keep length similar (±30% for text). Return valid JSON only."
+            )
+            return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
@@ -734,11 +733,18 @@ Return JSON: {{"original": "replacement", ...}}"""
         def build_prompt(chunk_samples):
             sample_str = "\n".join(f"- {s}" for s in chunk_samples)
             prompt = f"""Field: {field_key}
-Replace each phone number with another realistic phone number of the same format.
-Return JSON: {{"original_phone": "new_phone", ...}}
+Replace each phone number with another realistic phone number.
+- Keep EXACTLY same format (brackets, dashes, spaces, country code)
+- Same length as original
+- Return JSON: {{"original": "replacement", ...}}
 Phones:
 {sample_str}"""
-            return prompt, ""
+            system_prompt = (
+                "You are a data anonymization expert. "
+                "Phone format must be EXACT: same number of digits, same separators, same country code. "
+                "Output valid JSON only."
+            )
+            return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
@@ -753,12 +759,18 @@ Phones:
         def build_prompt(chunk_samples):
             sample_str = "\n".join(f'- "{s}"' for s in chunk_samples)
             prompt = f"""Field: {field_key}
-Replace each address with a realistic alternative address.
-Preserve the general structure but change street names, cities, etc.
-Return JSON: {{"original": "new", ...}}
+Replace each address with a realistic alternative.
+- Keep same structure (street, city, state, postal code)
+- Preserve separators and case
+- Return JSON: {{"original": "replacement", ...}}
 Addresses:
 {sample_str}"""
-            return prompt, ""
+            system_prompt = (
+                "You are a data anonymization expert. "
+                "Preserve address structure: same number of parts, same separators, same case pattern. "
+                "Output valid JSON only."
+            )
+            return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, stats, field_key=field_key)
 
@@ -775,12 +787,20 @@ Addresses:
             domain_info = ""
             if domain_stats:
                 top_domains = dict(list(domain_stats.items())[:5])
-                domain_info = f"\nTop domains to preserve distribution across: {top_domains}"
+                domain_info = f"\nTop domains to preserve: {top_domains}"
             prompt = f"""Field: {field_key}
-Generate realistic replacement emails preserving domain distribution.{domain_info}
-Return JSON: {{"original_email": "new_email", ...}}
+Generate replacement emails.{domain_info}
+- Keep EXACT same domain (e.g., @gmail.com stays @gmail.com)
+- Change only the local part before @
+- Same length as original email
+- Return JSON: {{"original": "replacement", ...}}
 Emails: {sample_str}"""
-            return prompt, ""
+            system_prompt = (
+                "You are a data anonymization expert. "
+                "CRITICAL: Domain must be EXACTLY the same (case-sensitive). "
+                "Only change the part before @. Output valid JSON only."
+            )
+            return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
@@ -794,10 +814,16 @@ Emails: {sample_str}"""
         def build_prompt(chunk_samples):
             sample_str = ", ".join(f'"{s}"' for s in chunk_samples)
             prompt = f"""Field: {field_key}
-Replace each job title with another realistic job title at a similar level.
-Return JSON: {{"original_title": "new_title", ...}}
+Replace each job title with another realistic title at similar level.
+- Keep similar length (±30%)
+- Preserve case pattern (each word capitalized)
+- Return JSON: {{"original": "replacement", ...}}
 Titles: {sample_str}"""
-            return prompt, ""
+            system_prompt = (
+                "You are a data anonymization expert. "
+                "Preserve alphabet and case pattern. Keep length similar. Output valid JSON only."
+            )
+            return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
@@ -811,10 +837,16 @@ Titles: {sample_str}"""
         def build_prompt(chunk_samples):
             sample_str = ", ".join(f'"{s}"' for s in chunk_samples)
             prompt = f"""Field: {field_key}
-Replace each company name with a realistic alternative company name.
-Return JSON: {{"original_company": "new_company", ...}}
+Replace each company name with a realistic alternative.
+- Keep similar length (±30%)
+- Preserve case pattern
+- Return JSON: {{"original": "replacement", ...}}
 Companies: {sample_str}"""
-            return prompt, ""
+            system_prompt = (
+                "You are a data anonymization expert. "
+                "Preserve alphabet and case pattern. Keep length similar. Output valid JSON only."
+            )
+            return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
@@ -828,10 +860,17 @@ Companies: {sample_str}"""
         def build_prompt(chunk_samples):
             sample_str = "\n".join(f'- "{s}"' for s in chunk_samples)
             prompt = f"""Field: {field_key}
-Replace each postal code with another valid postal code of the same format.
-Return JSON: {{"original": "new", ...}}
+Replace each postal code with another valid code of the same format.
+- Keep EXACTLY same length
+- Keep same separators (space, dash, none)
+- Return JSON: {{"original": "replacement", ...}}
 Codes:
 {sample_str}"""
-            return prompt, ""
+            system_prompt = (
+                "You are a data anonymization expert. "
+                "CRITICAL: Postal code must be EXACTLY same length and format. "
+                "Output valid JSON only."
+            )
+            return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, field_key=field_key)

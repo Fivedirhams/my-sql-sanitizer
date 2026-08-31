@@ -254,6 +254,16 @@ You are a data anonymization expert.
 Preserve alphabet and case pattern. Keep length similar. Output valid JSON only.
 ```
 
+**User Prompt:**
+```
+Field: {field_key}
+Replace each company name with a realistic alternative.
+- Keep similar length (±30%)
+- Preserve case pattern
+- Return JSON: {"original": "replacement", ...}
+Companies: "{company1}", "{company2}", ...
+```
+
 ### `AddressTransformer` (address)
 
 Новые улицы/дома/город, сохраняющие структуру.
@@ -265,9 +275,38 @@ Preserve address structure: same number of parts, same separators, same case pat
 Output valid JSON only.
 ```
 
+**User Prompt:**
+```
+Field: {field_key}
+Replace each address with a realistic alternative.
+- Keep same structure (street, city, state, postal code)
+- Preserve separators and case
+- Return JSON: {"original": "replacement", ...}
+Addresses:
+- "{address1}"
+- "{address2}"
+```
+
 ### `ComposerTransformer` (composer)
 
 Композиторы (аналогично NameTransformer, но с музыкальным контекстом).
+
+**System Prompt:**
+```
+You are a data anonymization expert. 
+Preserve the same alphabet and case pattern. 
+Keep length similar. Output valid JSON only.
+```
+
+**User Prompt:**
+```
+Field: {field_key}
+Replace each composer name with a realistic alternative composer.
+- Keep similar length (±30%)
+- Preserve case pattern
+- Return JSON: {"original": "replacement", ...}
+Composers: "{composer1}", "{composer2}", ...
+```
 
 ### `TitleTransformer` (title)
 
@@ -279,6 +318,16 @@ You are a data anonymization expert.
 Preserve alphabet and case pattern. Keep length similar. Output valid JSON only.
 ```
 
+**User Prompt:**
+```
+Field: {field_key}
+Replace each job title with another realistic title at similar level.
+- Keep similar length (±30%)
+- Preserve case pattern
+- Return JSON: {"original": "replacement", ...}
+Titles: "{title1}", "{title2}", ...
+```
+
 ---
 
 ## ⚙️ Конфигурация
@@ -286,25 +335,101 @@ Preserve alphabet and case pattern. Keep length similar. Output valid JSON only.
 ### config.yaml — полная структура
 
 ```yaml
-# === Маппинг полей к трансформерам ===
-# Если поле здесь НЕ указано → сработает автодетект (_auto_select_transformer)
+# =============================================================================
+# CloakDB Configuration — SQL Dump Sanitizer
+# =============================================================================
+# Format: Table.Column → transformer_type
+# Available types: name, email, phone, address, title, company, genre,
+#                  date_shuffle_year, date_shuffle_month, composer, postal_code
+# Special: skip — column passes through unchanged (PK/FK, metrics)
+# =============================================================================
+
 transforms:
-  Artist.Name: name                   # Имена музыкантов → LLM
-  Customer.FirstName: name            # Имена клиентов → LLM
-  Customer.LastName: name             # Фамилии → LLM
-  Customer.City: genre                # Города → циклический swap (без LLM!)
-  Customer.Country: genre             # Страны → циклический swap (без LLM!)
-  Customer.Email: email               # Почты → SHA256 (ZERO LLM)
-  Customer.Phone: phone               # Телефоны → format-preserving (ZERO LLM)
-  Customer.State: genre               # Штаты → циклический swap
-  Genre.Name: genre                   # Жанры → циклический swap (без LLM!)
-  MediaType.Name: genre               # Типы медиа → циклический swap
-  BillingAddress.PostalCode: postal_code  # Почтовые индексы → SHA256 (ZERO LLM)
-  Album.Title: title                  # Названия альбомов → LLM
-  Track.Name: name                    # Названия треков → LLM
-  Invoice.InvoiceDate: date_shuffle   # Даты счетов → shuffle дат
-  Employee.BirthDate: date_shuffle    # Даты рождения → shuffle дат
-  Employee.HireDate: date_shuffle     # Дата найма → shuffle дат
+  # ── Album ──
+  Album.AlbumId: skip
+  Album.ArtistId: skip
+  Album.Title: title
+
+  # ── Artist ──
+  Artist.ArtistId: skip
+  Artist.Name: name
+
+  # ── Customer ──
+  Customer.Address: address
+  Customer.City: genre
+  Customer.Company: company
+  Customer.Country: genre
+  Customer.CustomerId: skip
+  Customer.Email: email
+  Customer.Fax: phone
+  Customer.FirstName: name
+  Customer.LastName: name
+  Customer.Phone: phone
+  Customer.PostalCode: postal_code
+  Customer.State: genre
+  Customer.SupportRepId: skip
+
+  # ── Employee ──
+  Employee.Address: address
+  Employee.BirthDate: date_shuffle_year
+  Employee.City: genre
+  Employee.Country: genre
+  Employee.Email: email
+  Employee.EmployeeId: skip
+  Employee.Fax: phone
+  Employee.FirstName: name
+  Employee.HireDate: date_shuffle_year
+  Employee.LastName: name
+  Employee.Phone: phone
+  Employee.PostalCode: postal_code
+  Employee.ReportsTo: skip
+  Employee.State: genre
+  Employee.Title: title
+
+  # ── Genre ──
+  Genre.GenreId: skip
+  Genre.Name: genre
+
+  # ── Invoice ──
+  Invoice.BillingAddress: address
+  Invoice.BillingCity: genre
+  Invoice.BillingCountry: genre
+  Invoice.BillingPostalCode: postal_code
+  Invoice.BillingState: genre
+  Invoice.CustomerId: skip
+  Invoice.InvoiceDate: date_shuffle_year
+  Invoice.InvoiceId: skip
+  Invoice.Total: skip
+
+  # ── InvoiceLine ──
+  InvoiceLine.InvoiceId: skip
+  InvoiceLine.InvoiceLineId: skip
+  InvoiceLine.Quantity: skip
+  InvoiceLine.TrackId: skip
+  InvoiceLine.UnitPrice: skip
+
+  # ── MediaType ──
+  MediaType.MediaTypeId: skip
+  MediaType.Name: genre
+
+  # ── Playlist ──
+  Playlist.Name: name
+  Playlist.PlaylistId: skip
+
+  # ── PlaylistTrack ──
+  PlaylistTrack.PlaylistId: skip
+  PlaylistTrack.TrackId: skip
+
+  # ── Track ──
+  Track.AlbumId: skip
+  Track.Bytes: skip
+  Track.Composer: composer
+  Track.GenreId: skip
+  Track.MediaTypeId: skip
+  Track.Milliseconds: skip
+  Track.Name: genre
+  Track.TrackId: skip
+  Track.UnitPrice: skip
 
 # Параметры обработки (глубина выборки, пути вывода, таймауты) задаются в .env:
 #   SAMPLES_PER_FIELD=50, PROFILES_DIR=output/profiles,

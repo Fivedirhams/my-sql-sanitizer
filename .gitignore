@@ -28,3 +28,7 @@ Thumbs.db
 *.tmp
 *.swp
 *~
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

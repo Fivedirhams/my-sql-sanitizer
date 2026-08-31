@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Quick Start:
-#   1. cp .env.example .env  && vim .env  # Add your KODIK_API_KEY
+#   1. cp .env.example .env  && vim .env  # Укажи LLM_API_KEY (+ провайдер/модель)
 #   2. docker compose up --build           # Build & run wizard
 #   3. Select dump → review config → run!
 #
@@ -19,8 +19,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.cloakdb
-      args:
-        KODIK_API_KEY: ${KODIK_API_KEY:-}
     image: cloakdb:latest
 
     # Interactive wizard by default — or use --batch for CI
@@ -34,14 +32,13 @@ services:
       - ./my_dump.sql:/input/dump.sql:ro        # Your custom dump (optional, replace name)
 
     environment:
-      # LLM API — провайдер-нейтрально. Значение из .env рядом с docker-compose.yml.
-      # ofox используется как основной провайдер; KODIK_API_KEY оставлен как legacy-алиас.
+      # LLM — настраивается ЦЕЛИКОМ через .env: provider / model / endpoint / token.
+      # Пустые LLM_ENDPOINT и LLM_MODEL => берутся пресеты провайдера (см. config.py).
+      - LLM_PROVIDER=${LLM_PROVIDER:-ofox}
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - KODIK_API_KEY=${KODIK_API_KEY:-}
-      - LLM_ENDPOINT=${LLM_ENDPOINT:-https://api.ofox.ai/v1}
-      - LLM_MODEL=${LLM_MODEL:-bailian/qwen3.8-flash}
+      - LLM_ENDPOINT=${LLM_ENDPOINT:-}
+      - LLM_MODEL=${LLM_MODEL:-}
       - LLM_MAX_COMPLETION_TOKENS=${LLM_MAX_COMPLETION_TOKENS:-32768}
-      - MAX_TOKENS=${MAX_TOKENS:-32768}
       - BATCH_SIZE=${BATCH_SIZE:-20}
       # UTF-8 locale so the interactive wizard reads Cyrillic without crashing
       - LANG=C.UTF-8

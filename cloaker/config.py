@@ -8,8 +8,25 @@ from pathlib import Path
 from typing import Dict, Any
 
 
+# ── Provider presets ────────────────────────────────────
+# Всё OpenAI-совместимо; достаточно указать провайдер (или свой endpoint) в .env.
+PROVIDER_ENDPOINTS: Dict[str, str] = {
+    "ofox": "https://api.ofox.ai/v1",
+    "kodik": "https://api.kodikrouter.ru/v1",
+    "kodikrouter": "https://api.kodikrouter.ru/v1",
+    "openai": "https://api.openai.com/v1",
+}
+PROVIDER_DEFAULT_MODELS: Dict[str, str] = {
+    "ofox": "bailian/qwen3.8-flash",
+    "kodik": "qwen/qwen3.7-flash",
+    "kodikrouter": "qwen/qwen3.7-flash",
+    "openai": "gpt-4o-mini",
+}
+
+
 @dataclass
 class LLMConfig:
+    provider: str = "ofox"
     api_key: str = ""
     model: str = "bailian/qwen3.8-flash"
     endpoint: str = "https://api.ofox.ai/v1"
@@ -106,10 +123,26 @@ def load_config(config_path: str = "config.yaml") -> CloakDBConfig:
 
     cfg = CloakDBConfig()
 
-    # Load LLM settings from env (provider-neutral: LLM_API_KEY preferred, KODIK_API_KEY as legacy fallback)
-    cfg.llm.api_key = os.environ.get("LLM_API_KEY") or os.environ.get("KODIK_API_KEY", "")
-    cfg.llm.model = os.environ.get("LLM_MODEL", "bailian/qwen3.8-flash")
-    cfg.llm.endpoint = os.environ.get("LLM_ENDPOINT", "https://api.ofox.ai/v1")
+    # ── LLM settings — provider-neutral, настрока целиком через .env ──
+    #   LLM_PROVIDER   ofox | kodik | openai | ...   (пресет endpoint/модели)
+    #   LLM_API_KEY    токен доступа (алиас: LLM_API_TOKEN)
+    #   LLM_ENDPOINT   явный URL  (иначе берётся пресет провайдера)
+    #   LLM_MODEL      id модели  (иначе дефолт провайдера)
+    provider = (os.environ.get("LLM_PROVIDER") or "ofox").strip().lower()
+    cfg.llm.provider = provider
+
+    cfg.llm.api_key = (
+        os.environ.get("LLM_API_KEY")
+        or os.environ.get("LLM_API_TOKEN")
+        or ""
+    )
+
+    _ep = os.environ.get("LLM_ENDPOINT", "").strip()
+    cfg.llm.endpoint = _ep or PROVIDER_ENDPOINTS.get(provider, PROVIDER_ENDPOINTS["ofox"])
+
+    _mdl = os.environ.get("LLM_MODEL", "").strip()
+    cfg.llm.model = _mdl or PROVIDER_DEFAULT_MODELS.get(provider, "")
+
     cfg.llm.max_tokens = int(os.environ.get("LLM_MAX_COMPLETION_TOKENS", "32768"))
 
     # Process settings from env

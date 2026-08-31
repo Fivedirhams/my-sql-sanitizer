@@ -1,16 +1,14 @@
 # =============================================================================
 # CloakDB — Production Docker Image
-# Multi-stage build with pre-configured Kodik Router API key
+# CloakDB — Production Docker Image (OpenAI-compatible LLM, no secrets baked in)
 # =============================================================================
 # Usage:
-#   # Build with default token (from .env):
-#     docker buildx build -t cloakdb:latest .
+#   # Build image (NO secrets baked in — key supplied at runtime via -e / .env):
+#     docker build -t cloakdb:latest .
 #
-#   # Or override with your own token:
-#     docker buildx build --build-arg KODIK_API_KEY=sk-your-key -t cloakdb:latest .
-#
-#   # Run (mount your SQL dump to /input, get output from /output):
-#     docker run --rm -v ./my_dump.sql:/input/dump.sql -v ./results:/output cloakdb:latest
+#   # Run (pass LLM key via env; mount SQL dump to /input, take result from /output):
+#     docker run --rm -e LLM_API_KEY=sk-your-key \
+#       -v ./my_dump.sql:/input/dump.sql -v ./results:/output cloakdb:latest
 # =============================================================================
 
 FROM python:3.11-slim
@@ -23,9 +21,11 @@ ENV LANG=C.UTF-8 \
     PYTHONUTF8=1 \
     PYTHONIOENCODING=utf-8
 
-# ── Build Args ──────────────────────────────────────────────────
-ARG KODIK_API_KEY
-ENV KODIK_API_KEY=${KODIK_API_KEY:-default_key_placeholder}
+# ── Runtime env defaults (NO secret baked — pass LLM_API_KEY at run time) ──
+# The API key is intentionally NOT a build arg; keep secrets out of image layers.
+ENV LLM_PROVIDER=ofox \
+    LLM_ENDPOINT=https://api.ofox.ai/v1 \
+    LLM_MODEL=bailian/qwen3.8-flash
 
 # ── System Dependencies ─────────────────────────────────────────
 RUN apt-get update && \

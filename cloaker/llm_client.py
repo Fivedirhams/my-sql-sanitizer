@@ -1,4 +1,4 @@
-"""Kodik Router API client — batch transformation requests with adaptive chunking."""
+"""LLM API client (OpenAI-compatible) — batch transformation requests with adaptive chunking."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .config import CloakDBConfig
 
 
 class LLMClient:
-    """Call Kodik Router API for batch data generation.
+    """Call an OpenAI-compatible LLM /chat/completions API for batch data generation.
     
     Features adaptive chunking for large payloads (>~2.5KB raw prompt)
     to prevent 60s timeouts on columns like Employee_Address with

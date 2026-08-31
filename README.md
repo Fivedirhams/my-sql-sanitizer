@@ -394,10 +394,11 @@ output:
 
 | Переменная | Значение по умолчанию | Описание |
 |------------|----------------------|----------|
-| `LLM_API_KEY` | *(обязательно)* | API ключ вашего провайдера |
-| `LLM_ENDPOINT` | `https://api.kodikrouter.ru/v1` | URL Chat Completions API |
-| `LLM_MODEL` | `qwen/qwen3.7-flash` | Модель для генерации |
-| `MAX_TOKENS` | `4096` | Лимит токенов ответа LLM |
+| `LLM_PROVIDER` | `ofox` | Провайдер: `ofox` \| `kodik` \| `openai` \| свой (задаёт пресеты endpoint/модели) |
+| `LLM_API_KEY` | *(обязательно)* | Токен доступа (алиас: `LLM_API_TOKEN`) |
+| `LLM_ENDPOINT` | пресет провайдера | URL Chat Completions API (пусто → пресет) |
+| `LLM_MODEL` | пресет провайдера | Модель генерации (пусто → пресет) |
+| `LLM_MAX_COMPLETION_TOKENS` | `32768` | Лимит токенов ответа LLM |
 | `BATCH_SIZE` | `20` | Значений на один LLM-чанк |
 
 ### Почему чанкинг?
@@ -579,7 +580,7 @@ my-sql-sanitizer/
 
 ### Предварительные требования
 - Docker ≥ 20.10 и Docker Compose ≥ 2.0
-- API ключ Kodik Router (получите на https://api.kodikrouter.ru)
+- API ключ LLM-провайдера (ofox, Kodik Router, OpenAI … — любой OpenAI-совместимый)
 
 ### Шаг 1: Настройка окружения
 
@@ -593,10 +594,12 @@ vim .env
 
 Содержимое `.env`:
 ```ini
+LLM_PROVIDER=ofox
 LLM_API_KEY=sk-your-key-here
-LLM_ENDPOINT=https://api.kodikrouter.ru/v1
-LLM_MODEL=qwen/qwen3.7-flash
-MAX_TOKENS=4096
+# пусто → endpoint и модель берутся из пресета провайдера
+LLM_ENDPOINT=
+LLM_MODEL=
+LLM_MAX_COMPLETION_TOKENS=32768
 BATCH_SIZE=20
 ```
 
@@ -607,17 +610,14 @@ BATCH_SIZE=20
 docker compose build
 ```
 
-**Вариант B — ручная сборка:**
+**Вариант B — ручная сборка (секреты в образ НЕ попадают):**
 ```bash
-# Ключ подставляется через --build-arg
-LLM_KEY=$(cat .env | grep 'LLM_API_KEY=' | cut -d= -f2)
+# Собираем без запечённых ключей
+docker build -t cloakdb:latest .
 
-docker buildx build \
-  --build-arg LLM_API_KEY="$LLM_KEY" \
-  --build-arg LLM_ENDPOINT=https://api.kodikrouter.ru/v1 \
-  --build-arg LLM_MODEL=qwen/qwen3.7-flash \
-  --build-arg MAX_TOKENS=4096 \
-  -t cloakdb:latest .
+# Ключ и провайдер передаются в рантайме:
+docker run --rm -e LLM_API_KEY=sk-your-key -e LLM_PROVIDER=ofox \
+  -v $(pwd)/output:/output cloakdb:latest --batch /input/dump.sql -o /output/result.sql
 ```
 
 ### Шаг 3: Запуск

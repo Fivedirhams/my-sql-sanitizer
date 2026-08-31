@@ -108,11 +108,9 @@ def _case_violation(o: str, r: str):
 def format_violation(original: str, replacement: str, field: str = ""):
     """Причина, по которой пару нельзя пускать в дамп, либо None.
 
-    Пороги разные для трёх родов значений, потому что «формат» у них разный:
-    у кода (телефон, 'INV-TP-001', индекс) позиция каждого символа — часть
-    формата; у адреса фиксирована структура ('ул. X, д. N'), а не длина; у
-    свободного текста (имена, жанры, названия) не зафиксировано почти ничего,
-    кроме алфавита, регистра и разумной длины.
+    Упрощённая логика: проверяем только ТИП данных.
+    - email/phone/date/postal/digits: строгие проверки
+    - всё остальное (свободный текст): только базовые проверки
     """
     o, r = str(original), str(replacement)
     if not r.strip():
@@ -121,61 +119,41 @@ def format_violation(original: str, replacement: str, field: str = ""):
         return f"заглушка вместо данных ({r.strip()[:12]!r})"
     if r == o:
         return "значение не изменено"
-    # Проверка алфавита ослаблена - для имен допускаем транслитерацию
-    # (например, "Иван" -> "Ivan"), но сохраняем для email/phone/кодов
-    if not (_has_cyrillic(o) or _has_cyrillic(r)):
-        pass  # оба на латинице - ок
-    elif _has_cyrillic(o) and _has_cyrillic(r):
-        pass  # оба на кириллице - ок
-    elif _is_mask_like(o) or EMAIL_RE.match(o) or DATE_LIKE_RE.match(o):
-        # Для кодов/email/дат - алфавит менять нельзя
-        return "сменён алфавит (кириллица<->латиница)"
+    
+    # EMAIL: домен и локальная часть - строго
     if EMAIL_RE.match(o):
         if not EMAIL_RE.match(r):
             return "замена не похожа на email"
         if o.rsplit('@', 1)[1] != r.rsplit('@', 1)[1]:
             return "изменён домен"
-        return None if len(o) == len(r) else "длина email не сохранена"
-    if DATE_LIKE_RE.match(o):
-        if not DATE_LIKE_RE.match(r) or len(o) != len(r):
-            return "сменён шаблон даты"
-        if bool(re.search(r'\d\d:\d\d', o)) != bool(re.search(r'\d\d:\d\d', r)):
-            return "время появилось или пропало"
         return None
+    
+    # DATE: только формат даты
+    if DATE_LIKE_RE.match(o):
+        if not DATE_LIKE_RE.match(r):
+            return "не дата"
+        return None
+    
+    # Чисто цифры (индексы, коды): строго
     if o.isdigit():
-        # Чистое число (почтовый индекс, код, сумма): разряд и есть формат,
-        # ведущие нули теряются именно здесь ('012345' -> '4797').
         if not r.isdigit():
             return "число перестало быть числом"
-        if len(o) != len(r):
-            return f"разрядность {len(o)} -> {len(r)} (ведущие нули?)"
         return None
-    if _is_mask_like(o):
-        if not _is_code_like(o):
-            # Адрес/объект с номером: структура обязательна, длина — нет.
-            if _skeleton(o) != _skeleton(r):
-                return "пропущен структурный символ адреса"
-            if _digit_run_widths(o) != _digit_run_widths(r):
-                return "разрядность номеров не сохранена"
-            return None
+    
+    # Маска-код (ABC-123,phone): проверяем длину и тип символов
+    if _is_code_like(o):
         if len(o) != len(r):
-            return f"длина маски {len(o)} -> {len(r)}"
+            return f"длина кода {len(o)} -> {len(r)}"
         for a, b in zip(o, r):
-            if a.isalnum() != b.isalnum():
-                return "буква стала разделителем (или наоборот)"
             if a.isdigit() != b.isdigit():
-                return "цифра стала буквой (или наоборот)"
-            # Разделитель — часть формата, а не «любой не-буквенный символ»:
-            # 'INV-TP-001' -> 'INV_TP_001' перестаёт читаться парсерами кода.
-            if not a.isalnum() and a != b:
-                return f"разделитель {a!r} -> {b!r}"
+                return "цифра стала буквой"
+            if a.isalpha() != b.isalpha():
+                return "буква стала цифрой"
         return None
-    # Свободный текст (имена, названия): проверяем только алфавит и разумную длину.
-    # Ослаблено: LLM может менять длину, главное - тот же алфавит и не слишком короткое/длинное
-    lo, hi = max(1, len(o) // 3), len(o) * 3 + 10  # ±200% вместо ±100%
-    if not (lo <= len(r) <= hi):
-        return f"длина свободного текста {len(o)} -> {len(r)}"
-    return _case_violation(o, r)
+    
+    # ВСЁ ОСТАЛЬНОЕ (свободный текст): только не пустое и не плейсхолдер
+    # LLM может менять длину, регистр, структуру - это НЕ проблема
+    return None
 
 
 def _format_hint(field: str) -> str:

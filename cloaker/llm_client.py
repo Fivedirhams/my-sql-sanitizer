@@ -127,7 +127,14 @@ def format_violation(original: str, replacement: str, field: str = ""):
         return f"заглушка вместо данных ({r.strip()[:12]!r})"
     if r == o:
         return "значение не изменено"
-    if _has_cyrillic(o) != _has_cyrillic(r):
+    # Проверка алфавита ослаблена - для имен допускаем транслитерацию
+    # (например, "Иван" -> "Ivan"), но сохраняем для email/phone/кодов
+    if not (_has_cyrillic(o) or _has_cyrillic(r)):
+        pass  # оба на латинице - ок
+    elif _has_cyrillic(o) and _has_cyrillic(r):
+        pass  # оба на кириллице - ок
+    elif _is_mask_like(o) or EMAIL_RE.match(o) or DATE_LIKE_RE.match(o):
+        # Для кодов/email/дат - алфавит менять нельзя
         return "сменён алфавит (кириллица<->латиница)"
     if EMAIL_RE.match(o):
         if not EMAIL_RE.match(r):
@@ -169,10 +176,9 @@ def format_violation(original: str, replacement: str, field: str = ""):
             if not a.isalnum() and a != b:
                 return f"разделитель {a!r} -> {b!r}"
         return None
-    # Свободный текст: ширины нет, бракуем только явный перекос — иначе
-    # 'Инди' -> 'Электроника' отбивалось бы ложно и весь LLM-путь встал бы в
-    # мусорный генератор.
-    lo, hi = max(2, len(o) // 2), len(o) * 2 + 8
+    # Свободный текст (имена, названия): проверяем только алфавит и разумную длину.
+    # Ослаблено: LLM может менять длину, главное - тот же алфавит и не слишком короткое/длинное
+    lo, hi = max(1, len(o) // 3), len(o) * 3 + 10  # ±200% вместо ±100%
     if not (lo <= len(r) <= hi):
         return f"длина свободного текста {len(o)} -> {len(r)}"
     return _case_violation(o, r)
@@ -672,7 +678,10 @@ class LLMClient:
             sample_str = ", ".join(f'"{s}"' for s in chunk_samples)
             system_prompt = (
                 "You are a professional data anonymization expert. "
-                "Generate realistic anonymized replacements for each name provided. "
+                "Generate realistic anonymized replacements for each name. "
+                "IMPORTANT: Preserve the same ALPHABET (Latin stays Latin, Cyrillic stays Cyrillic). "
+                "Keep name length similar (±30%). "
+                "Match the case pattern (first letters capitalized). "
                 "All output must be valid JSON only, no explanation text."
             )
             prompt = f"""Field: {field_key}
@@ -681,9 +690,12 @@ Description: {description}
 Original values ({len(chunk_samples)} total):
 {sample_str}
 
-Replace each of these names with a realistic, culturally appropriate alternative name.
-Return a JSON object where keys are the original names and values are the new names.
-Example: {{"John Smith": "James Anderson", "Jane Doe": "Sarah Williams"}}"""
+Replace each name with a realistic alternative name. 
+- Keep same alphabet (if original is Cyrillic, output Cyrillic; if Latin, output Latin)
+- Keep similar length (±30% is OK)
+- Preserve case pattern (first letter capitalized)
+- Return ONLY valid JSON: {{"original": "replacement", ...}}
+Example: {{"John Smith": "James Anderson", "Иван Петров": "Алексей Сидоров"}}"""
             return prompt, system_prompt
         
         return self._call_api_chunked(build_prompt, samples, stats, field_key=field_key)

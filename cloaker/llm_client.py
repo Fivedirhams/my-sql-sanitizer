@@ -11,12 +11,22 @@ from typing import Dict, Any, List, Optional, Callable
 from .config import CloakDBConfig
 
 
+class LLMTimeoutError(RuntimeError):
+    """API не ответил за отведённое время.
+
+    Сообщение намеренно короткое и НЕ содержит команду curl: subprocess.
+    TimeoutExpired в стандартном виде печатает всю команду целиком, включая
+    заголовок 'Authorization: Bearer <ключ>' — то есть сливает секрет в логи.
+    """
+
+
 class LLMClient:
     """Call an OpenAI-compatible LLM /chat/completions API for batch data generation.
-    
-    Features adaptive chunking for large payloads (>~2.5KB raw prompt)
-    to prevent 60s timeouts on columns like Employee_Address with
-    long multi-line address strings.
+
+    Chunking is driven by GENERATION TIME, not prompt size: gateways such as ofox
+    drop the connection at ~60s (curl rc=52), so a chunk must finish well inside
+    that window. Chunks are capped by value count (see max_values_per_chunk) and
+    are halved-and-retried whenever one comes back empty.
     """
 
     def __init__(self, config: CloakDBConfig) -> None:
@@ -25,8 +35,19 @@ class LLMClient:
         self._last_call = 0.0
         # Chunking parameters for large payloads
         self.chunk_max_chars = 2500       # Approx chars per sub-request
-        self.timeout_base = 30            # Base timeout per chunk (seconds)
-        self.timeout_max = 55             # Safety margin under container limit
+        # ЖЁСТКИЙ лимит на число значений в одном запросе. Узкое место — не размер
+        # промпта, а длительность генерации: гейтвей ofox обрывает коннект на ~60s
+        # (замерено: 20 значений ≈ 26s успешно, 40+ ≈ curl rc=52 empty reply).
+        # Поэтому чанки маленькие, плюс авто-деление пополам при пустом ответе.
+        self.max_values_per_chunk = 20
+        self.max_split_depth = 3          # 20 -> 10 -> 5 -> 2
+        # Бюджет времени считается АДАПТИВНО под каждый запрос (_chunk_timeout):
+        # reasoning-модели тратят скрытые reasoning-токены из того же max_tokens,
+        # поэтому чанк на ~100 значений может идти минуты, а не десятки секунд.
+        self.timeout_base = max(config.llm.timeout_base, 5)
+        self.timeout_max = max(config.llm.timeout_max, self.timeout_base)
+        self.timeout_per_value = 2.0      # сек на одно значение в чанке
+        self.timeout_per_kb = 8.0         # сек на 1KB промпта
 
     def _safe_rate_limit(self) -> None:
         """Minimum interval between calls."""
@@ -50,6 +71,57 @@ class LLMClient:
         payload["messages"] = messages
         return payload
 
+    def _chunk_timeout(self, n_values: int, prompt_len: int) -> int:
+        """Таймаут одного запроса, сек, по реальному объёму работы.
+
+        Замена прежнего `base + chunk_index * 5`: масштабирование по ИНДЕКСУ
+        чанка голодало самый первый (и самый большой) чанок каждой колонки —
+        он стабильно падал на 30-секундном лимите.
+        """
+        est = (
+            self.timeout_base
+            + n_values * self.timeout_per_value
+            + (prompt_len / 1000.0) * self.timeout_per_kb
+        )
+        return int(max(self.timeout_base, min(est, self.timeout_max)))
+
+    def _call_chunk_with_split(self, chunk: List[str], build_prompt_fn: Callable,
+                               index: int = 0, total: int = 1,
+                               depth: int = 0) -> Dict[str, str]:
+        """Один чанк с рекурсивным дроблением при пустом ответе.
+
+        Пустой ответ на длинном запросе почти всегда означает не «модель не смогла»,
+        а обрыв соединения на стороне гейтвея (упор в ~60s). Такой чанк делится
+        пополам и повторяется, пока не упрётся в разумный минимум или потолок
+        глубины. Это и есть реальная «адаптивность» — прежняя адаптивность по
+        символам от этого не защищала.
+        """
+        prompt, system_prompt = build_prompt_fn(chunk)
+        timeout = self._chunk_timeout(len(chunk), len(prompt))
+        label = f"chunk {index}/{total}" if not depth else f"{index}/{total}.d{depth}"
+
+        try:
+            result = self._call_single(prompt, system_prompt, timeout=timeout)
+        except LLMTimeoutError as e:
+            print(f"  [WARN] {label}: {e}")
+            result = {}
+
+        if result or depth >= self.max_split_depth or len(chunk) <= 3:
+            if depth == 0 and total > 1:
+                print(f"  [{label}] {len(chunk)} значений → {len(result)} записей")
+            return result
+
+        mid = len(chunk) // 2
+        print(f"      ⤷ {label}: пусто при {len(chunk)} значениях — делю пополам "
+              f"(глубина {depth + 1})")
+        left = self._call_chunk_with_split(chunk[:mid], build_prompt_fn, index, total,
+                                           depth + 1)
+        right = self._call_chunk_with_split(chunk[mid:], build_prompt_fn, index, total,
+                                            depth + 1)
+        merged = dict(left)
+        merged.update(right)
+        return merged
+
     def _execute_curl(self, payload: dict, timeout: int) -> Dict[str, Any]:
         """Execute a single curl subprocess call. Returns {} on any error."""
         cmd = [
@@ -59,7 +131,10 @@ class LLMClient:
             "-H", f"Authorization: Bearer {self.config.llm.api_key}",
             "-d", json.dumps(payload),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise LLMTimeoutError(f"API timeout after {timeout}s") from None
         
         if result.returncode != 0:
             return {}
@@ -86,14 +161,17 @@ class LLMClient:
     def _retry_once(self, payload: dict, timeout: int) -> Optional[str]:
         """Retry a failed/empty response once (common with qwen models)."""
         time.sleep(1.5)
-        result = subprocess.run(
-            ["curl", "-s", "-X", "POST",
-             f"{self.config.llm.endpoint}/chat/completions",
-             "-H", "Content-Type: application/json",
-             "-H", f"Authorization: Bearer {self.config.llm.api_key}",
-             "-d", json.dumps(payload)],
-            capture_output=True, text=True, timeout=timeout
-        )
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "-X", "POST",
+                 f"{self.config.llm.endpoint}/chat/completions",
+                 "-H", "Content-Type: application/json",
+                 "-H", f"Authorization: Bearer {self.config.llm.api_key}",
+                 "-d", json.dumps(payload)],
+                capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            raise LLMTimeoutError(f"API timeout after {timeout}s (retry)") from None
         if result.returncode != 0:
             return ""
         try:
@@ -105,19 +183,27 @@ class LLMClient:
             pass
         return ""
 
-    def _call_single(self, prompt: str, system_prompt: str = "", timeout: int = 45) -> Dict[str, Any]:
+    def _call_single(self, prompt: str, system_prompt: str = "",
+                     timeout: Optional[int] = None) -> Dict[str, Any]:
         """Make ONE API call with rate limiting and retry logic."""
         self._safe_rate_limit()
         self._call_count += 1
         self._last_call = time.time()
 
+        # Явный timeout не задан — считаем по размеру промпта.
+        if timeout is None:
+            timeout = self._chunk_timeout(0, len(prompt))
+
         payload = self._build_payload(prompt, system_prompt)
         
         content = self._execute_curl(payload, timeout)
         
-        # If empty, retry once
+        # If empty, retry once. Повтор получает увеличенный бюджет: идентичный
+        # запрос с тем же таймаутом повторил бы ровно тот же timeout.
         if not content:
-            content = self._retry_once(payload, timeout)
+            content = self._retry_once(
+                payload, min(int(timeout * 1.5), self.timeout_max)
+            )
 
         if not content:
             return {}  # Safe fallback
@@ -138,20 +224,25 @@ class LLMClient:
         item_cost = 80       # Average chars per item in formatted prompt
         return base_overhead + len(items) * item_cost
 
-    def _split_by_budget(self, samples: List[str], max_chars: int = None, max_values_per_chunk: int = 150) -> List[List[str]]:
+    def _split_by_budget(self, samples: List[str], max_chars: int = None,
+                         max_values_per_chunk: int = None) -> List[List[str]]:
         """Split samples into chunks based on both size AND value count limits.
-        
-        With max_tokens=32768 (updated from 4096), we can safely handle ~150 values
-        per API call while leaving ample room for JSON overhead and system prompt.
-        
+
+        Лимит по числу значений первичен: запрос должен успеть сгенерироваться до
+        обрыва соединения на стороне гейтвея (~60s у ofox), а не влезть в контекст.
+
         Args:
             samples: List of unique values to transform
             max_chars: Char budget per chunk (optional, uses estimate_chars default)
-            max_values_per_chunk: Hard cap on values per chunk (default 150)
+            max_values_per_chunk: Hard cap on values per chunk
+                (default: self.max_values_per_chunk)
         """
         if not samples:
             return []
-        
+
+        if max_values_per_chunk is None:
+            max_values_per_chunk = self.max_values_per_chunk
+
         chunks = []
         current_chunk = []
         current_estimated = self._estimate_chars([])  # Start with base overhead
@@ -200,36 +291,21 @@ class LLMClient:
         Returns:
             Merged {original: replacement} dict from all chunks
         """
-        raw_estimate = sum(len(s) for s in samples)
-        
-        # Estimate number of chunks needed
-        num_chunks = max(1, int(raw_estimate / self.chunk_max_chars) + 1)
-        print(f"      🔄 Calling LLM ({len(samples)} values, ~{num_chunks} chunk(s))...")
-        
-        # CRITICAL UPDATE: With max_tokens=32768, we can safely handle ~150 values per call.
-        # This reduces API calls by 10x compared to previous limit of 15 values/call.
-        SAFE_VALUES_PER_CALL = 150
-        SAFE_RAW_CHARS = self.chunk_max_chars * 3  # generous buffer for prompt overhead
-        
-        # Chunk if EITHER condition triggers
-        if raw_estimate <= SAFE_RAW_CHARS and len(samples) <= SAFE_VALUES_PER_CALL:
-            # Single call is safe
-            prompt, system_prompt = build_prompt_fn(samples)
-            return self._call_single(prompt, system_prompt, timeout=45)
-        
-        # Split into manageable chunks by prompt size budget
+        # Один путь для всех случаев: режем на чанки и идём по ним. Раньше
+        # колонки до 150 значений уходили ОДНИМ запросом — на гейтвее с обрезкой
+        # коннекта на 60s это гарантированно означало потерянную колонку целиком.
         chunks = self._split_by_budget(samples)
+        if not chunks:
+            return {}
+
+        print(f"      🔄 Calling LLM ({len(samples)} values → {len(chunks)} chunk(s)"
+              f" × ≤{self.max_values_per_chunk})...")
+
         all_results = []
-        
         for i, chunk in enumerate(chunks):
-            prompt, system_prompt = build_prompt_fn(chunk)
-            # Larger chunks get slightly more timeout budget
-            chunk_timeout = min(self.timeout_base + i * 5, self.timeout_max)
-            
-            print(f"  [chunk {i+1}/{len(chunks)}] {len(chunk)} values, est {len(prompt)//100}KB")
-            
-            result = self._call_single(prompt, system_prompt, timeout=chunk_timeout)
-            all_results.append(result)
+            all_results.append(
+                self._call_chunk_with_split(chunk, build_prompt_fn, i + 1, len(chunks))
+            )
             
             # Brief pause between chunks to avoid rate limits
             if i < len(chunks) - 1:

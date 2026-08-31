@@ -31,6 +31,8 @@ class LLMConfig:
     model: str = "bailian/qwen3.8-flash"
     endpoint: str = "https://api.ofox.ai/v1"
     max_tokens: int = 32768  # Increased from 4096 to support ~150 values per API call
+    timeout_base: int = 45   # нижняя граница таймаута одного запроса, сек (env: LLM_TIMEOUT_BASE)
+    timeout_max: int = 180   # потолок таймаута самого крупного чанка, сек (env: LLM_TIMEOUT_MAX)
 
 
 @dataclass
@@ -142,6 +144,10 @@ def load_config(config_path: str = "config.yaml") -> CloakDBConfig:
     cfg.llm.model = _mdl or PROVIDER_DEFAULT_MODELS.get(provider, "")
 
     cfg.llm.max_tokens = int(os.environ.get("LLM_MAX_COMPLETION_TOKENS", "32768"))
+
+    # Таймауты одного запроса: считаются адаптивно по размеру чанка, здесь только границы.
+    cfg.llm.timeout_base = int(os.environ.get("LLM_TIMEOUT_BASE", "45"))
+    cfg.llm.timeout_max = int(os.environ.get("LLM_TIMEOUT_MAX", "180"))
 
     # Process settings from env
     # (размер LLM-чанка фиксирован внутри llm_client: ~150 значений / 2500 симв. — не env-ручка)

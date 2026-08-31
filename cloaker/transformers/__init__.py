@@ -13,6 +13,7 @@ from cloaker.transformers.composer_transformer import ComposerTransformer
 from cloaker.transformers.postal_code_transformer import PostalCodeTransformer
 from cloaker.transformers.crm_status_transformer import CRMStatusTransformer
 from cloaker.transformers.id_guardian_transformer import IDGuardianTransformer
+from cloaker.transformers.skip_transformer import SkipTransformer
 
 TRANSFORMER_MAP = {
     "name": NameTransformer,
@@ -28,6 +29,8 @@ TRANSFORMER_MAP = {
     "postal_code": PostalCodeTransformer,
     "crm_status": CRMStatusTransformer,
     "id_guardian": IDGuardianTransformer,
+    # Явный passthrough: поля, которые намеренно не меняются (деньги, примечания).
+    "skip": SkipTransformer,
 }
 
 

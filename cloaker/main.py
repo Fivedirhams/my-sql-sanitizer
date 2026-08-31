@@ -341,7 +341,10 @@ class SQLProcessor:
                     print(f"  [{loaded}] {field_key} ({transformer_type}): {len(transformer._mapping)} entries")
                 
             except Exception as e:
-                print(f"  [WARN] Failed to load {field_key}: {e}")
+                # str(e)[:200]: стандартное сообщение subprocess.TimeoutExpired
+                # включает команду целиком — с заголовком Authorization и ключом.
+                detail = " ".join(str(e).split())[:200]
+                print(f"  [WARN] Failed to load {field_key}: {type(e).__name__}: {detail}")
                 skipped += 1
         
         print(f"\n  Loaded mappings: {loaded}, Skipped (PK/FK/<2 samples): {skipped}")

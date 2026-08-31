@@ -39,6 +39,8 @@ services:
       - LLM_ENDPOINT=${LLM_ENDPOINT:-}
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_MAX_COMPLETION_TOKENS=${LLM_MAX_COMPLETION_TOKENS:-32768}
+      - LLM_TIMEOUT_BASE=${LLM_TIMEOUT_BASE:-45}
+      - LLM_TIMEOUT_MAX=${LLM_TIMEOUT_MAX:-180}
       - SAMPLES_PER_FIELD=${SAMPLES_PER_FIELD:-50}
       - PROFILES_DIR=${PROFILES_DIR:-output/profiles}
       # UTF-8 locale so the interactive wizard reads Cyrillic without crashing

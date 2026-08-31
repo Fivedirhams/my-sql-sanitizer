@@ -112,6 +112,17 @@ def preview_generated_config(selected_fields: Dict[str, dict]) -> str:
 
 
 # ── Интерактивный мастер ───────────────────────────────────────
+def resolve_output_path(in_path: Path, config) -> Path:
+    """Путь результата по умолчанию.
+
+    Всегда кладём в каталог output/ (в контейнере examples/ и /input смонтированы
+    read-only — писать рядом со входом нельзя). Каталог создаётся при необходимости.
+    """
+    out_dir = Path(config.profiles_dir).parent or Path(".")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"{in_path.stem}_sanitized.sql"
+
+
 def run_interactive_wizard(examples_dir: Path, config_path: Path) -> bool:
     """
     Полноценный пошаговый мастер:
@@ -215,7 +226,7 @@ def run_interactive_wizard(examples_dir: Path, config_path: Path) -> bool:
         return False
 
     # Финальное подтверждение запуска
-    output_path = dump_path.with_suffix("_sanitized.sql")
+    output_path = resolve_output_path(dump_path, config)
     proceed = Confirm.ask(
         f"\n▶ Запустить анонимизацию?\n"
         f"   Вход:   {dump_path.name}\n"
@@ -227,7 +238,7 @@ def run_interactive_wizard(examples_dir: Path, config_path: Path) -> bool:
         return False
 
     # ── Шаг 4: Запуск санитайзинга с живым прогрессом ───────────
-    console.print("\n[bold green]═══ Шаг 4/4: Запуск обработки ═══[/bold cyan]\n")
+    console.print("\n[bold green]═══ Шаг 4/4: Запуск обработки ═══[/bold green]\n")
 
     console.print(f"  Вход:     {dump_path}")
     console.print(f"  Выход:    {output_path}")
@@ -275,7 +286,7 @@ def run_batch_mode(input_path: str, output_path: Optional[str], config_path: str
     processor = SQLProcessor(config)
 
     in_path = Path(input_path)
-    out_path = Path(output_path) if output_path else in_path.with_suffix("_sanitized.sql")
+    out_path = Path(output_path) if output_path else resolve_output_path(in_path, config)
 
     console.print(f"[bold]🚀 CloakDB Batch Mode[/bold]\n")
     console.print(f"  Input:    {in_path}")

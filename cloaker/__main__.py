@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from rich.console import Console
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
@@ -24,7 +24,7 @@ from rich.progress import (
 from rich.live import Live
 
 from cloaker.config import load_config
-from cloaker.main import SQLProcessor
+from cloaker.main import SQLProcessor, detect_sql_encoding, DumpNotAnonymizable
 
 console = Console()
 
@@ -42,9 +42,14 @@ TRANSFORMER_INFO = {
     "genre":       "🎭 Категории/жанры (циклическая замена)",
     "composer":    "🎵 Композиторы (LLM)",
     "postal_code": "📮 Почтовые индексы (формат сохранён)",
-    "crm_status":  "⚙️ Бизнес-статусы/энумы (циклическая)",
-    "skip":        "⏭ Пропуск (PK/FK, ИНН, метрики)",
+    "skip":        "⏭ Пропуск (PK/FK, метрики)",
 }
+
+
+# Типы, чьи трансформеры обращаются к API (см. generate_* в cloaker/transformers/).
+# Остальные (email, phone, postal_code, genre, date_shuffle_*, title-локальные,
+# skip) детерминированные и сети не требуют.
+LLM_BACKED_TYPES = ("name", "title", "company", "composer", "address")
 
 
 # ── Меню выбора БД ──────────────────────────────────────────────
@@ -68,6 +73,10 @@ def show_dump_menu(examples_dir: Path) -> Optional[Path]:
         table.add_row(str(i), dump.name, size_str)
 
     console.print(table)
+    if len(dumps) == 1:
+        # Демо-база одна — спрашивать не о чем, а лишний ввод в визарде
+        # это лишняя точка падения (кривая консоль, EOF, не-UTF-8).
+        return dumps[0]
     choices = [str(i) for i in range(1, len(dumps) + 1)]
     choice = Prompt.ask("Выберите базу для обработки", choices=choices, default="1")
     return dumps[int(choice) - 1]
@@ -95,20 +104,39 @@ def show_classification_table(selected_fields: Dict[str, dict]) -> None:
 
 
 def preview_generated_config(selected_fields: Dict[str, dict]) -> str:
-    """Сгенерировать превью config.yaml на основе авто-детекта."""
+    """Сгенерировать превью config.yaml на основе авто-детекта (формат Table.Column)."""
+    # Группируем по таблице
+    from collections import defaultdict
+    by_table = defaultdict(dict)
+    for field_key, info in selected_fields.items():
+        parts = field_key.split('_', 1)
+        if len(parts) != 2:
+            continue
+        table, column = parts
+        by_table[table][column] = info['type']
+    
     lines = [
         "# === Авто-сгенерированная конфигурация CloakDB ===",
         "# Проверьте типы перед запуском!",
         "",
         "transforms:",
     ]
-    for fk, info in sorted(selected_fields.items()):
-        typ = info["type"]
-        line = f"  {fk}: {typ}"
-        if info.get("note"):
-            line += f"  #{info['note']}"
-        lines.append(line)
+    
+    for table in sorted(by_table.keys()):
+        cols = by_table[table]
+        lines.append(f"  # ── {table} ──")
+        for col in sorted(cols.keys()):
+            t = cols[col]
+            lines.append(f"  {table}.{col}: {t}")
+    
+    lines.extend(["", "processing: {}", "output: {}"])
     return "\n".join(lines)
+
+
+def apply_generated_config(selected_fields: Dict[str, dict], config_path: Path) -> None:
+    """Записать авто-конфиг в файл config.yaml."""
+    content = preview_generated_config(selected_fields)
+    config_path.write_text(content, encoding="utf-8")
 
 
 # ── Интерактивный мастер ───────────────────────────────────────
@@ -121,6 +149,18 @@ def resolve_output_path(in_path: Path, config) -> Path:
     out_dir = Path(config.profiles_dir).parent or Path(".")
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir / f"{in_path.stem}_sanitized.sql"
+
+
+def ask_yes_no(question: str, default_yes: bool = True) -> bool:
+    """Да/нет числом: 1 — да, 2 — нет.
+
+    Текстовый Confirm.ask требует ровно 'y'/'n' и на Windows-консоли с кириллицей
+    или EOF валился traceback'ом посреди визарда. Число принимает Prompt с choices,
+    а не-числовой ввод он переспрашивает сам.
+    """
+    console.print(question)
+    return Prompt.ask("  Ответ (1 — да, 2 — нет)", choices=["1", "2"],
+                      default="1" if default_yes else "2") == "1"
 
 
 def run_interactive_wizard(examples_dir: Path, config_path: Path) -> bool:
@@ -154,6 +194,14 @@ def run_interactive_wizard(examples_dir: Path, config_path: Path) -> bool:
         return False
 
     processor = SQLProcessor(config)
+
+    # Кодировку определяем до первого чтения: шаг 2 читает файл напрямую, минуя
+    # process_file, и без этого cp1251-выгрузка валилась здесь traceback'ом.
+    processor._dump_encoding = detect_sql_encoding(dump_path)
+    if processor._dump_encoding not in ("utf-8", "utf-8-sig"):
+        console.print(
+            f"[yellow]⚠  Дамп в кодировке {processor._dump_encoding} — "
+            f"выход напишу в ней же, чтобы IMPORT не сломался[/yellow]\n")
 
     # Фаза 2A: Сбор сэмплов с ProgressBar
     console.print("[dim]Фаза 2a — Сканирование дамп-файла и сбор уникальных значений...[/dim]")
@@ -201,41 +249,66 @@ def run_interactive_wizard(examples_dir: Path, config_path: Path) -> bool:
         border_style="yellow"
     ))
 
-    # Информация о стоимости LLM
-    llm_types = [t for t, info in selected_fields.items()
-                 if info["type"] not in ("skip", "genre", "crm_status", "date_shuffle_year", "date_shuffle_month")]
-    local_types = [t for t, info in selected_fields.items()
-                   if info["type"] in ("skip", "genre", "crm_status", "date_shuffle_year", "date_shuffle_month")]
+    # Информация о стоимости LLM. Считаем ЗАПРОСЫ, а не поля: в одно поле лезет
+    # до sample_limit уникалов, в один запрос — до max_values_per_chunk. Раньше
+    # визард обещал «~22 вызова» (по числу полей), а движок делал сотни — и шаг 4
+    # выглядел как зависший.
+    llm_fields = [fk for fk, info in selected_fields.items()
+                  if info["type"] in LLM_BACKED_TYPES]
+    local_fields = [fk for fk, info in selected_fields.items()
+                    if info["type"] not in LLM_BACKED_TYPES]
+    try:
+        from cloaker.llm_client import LLMClient
+        chunk = LLMClient(config).max_values_per_chunk
+    except Exception:
+        chunk = 20
+    chunk = 20
+    try:
+        from cloaker.llm_client import LLMClient
+        chunk = LLMClient(config).max_values_per_chunk
+    except Exception:
+        pass
+    # Считаем по ВСЕМ уникальным значениям поля: через API проходит каждый
+    # уникальный value, усечения нет (иначе часть значений не поменялась бы).
+    llm_values = sum(len(raw_samples.get(fk, [])) for fk in llm_fields)
+    est_calls = sum(-(-len(raw_samples.get(fk, [])) // chunk) for fk in llm_fields)
 
-    if llm_types:
-        console.print(f"\n[dim]ℹ️  Будет сделано ~{len(llm_types)} вызовов к LLM API[/dim]")
-        console.print(f"   💰 Примерная стоимость: $~{len(llm_types) * 0.002:.2f}")
-    if local_types:
-        console.print(f"   ✅ {len(local_types)} полей будут обработаны локально (без LLM)")
+    if llm_fields:
+        console.print(f"\n[dim]ℹ️  Через LLM: {len(llm_fields)} полей, "
+                      f"{llm_values} уникальных значений → ~{est_calls} запросов "
+                      f"(по ≤{chunk} значений)[/dim]")
+        console.print(f"[dim]   💰 Примерная стоимость: ${est_calls * 0.002:.2f}, "
+                      f"ожидаемо ~{est_calls * 25 / 60:.0f} мин (первый прогон)[/dim]")
+        console.print("   ♻ Повторный прогон того же дампа читает маппинг с диска "
+                      "(output/global_mapping.json) и сети почти не трогает")
+    if local_fields:
+        console.print(f"   ✅ {len(local_fields)} полей будут обработаны локально (без LLM)")
 
-    # Вопрос: использовать авто-конфиг?
-    use_auto = Confirm.ask(
-        "\n✅ Использовать автоматически подобранные типы?\n"
-        "   (Отвечайте 'n' чтобы отредактировать config.yaml вручную)",
-        default=True
+    # Вопрос: использовать конфиг по умолчанию (config.yaml) или редактировать?
+    # Наш config.yaml уже правильно настроен для выбранной базы.
+    use_default = ask_yes_no(
+        "\n✅ Применить конфигурацию по умолчанию?\n"
+        "   1 — да (использовать текущий config.yaml)\n"
+        "   2 — нет (открыть config.yaml для редактирования)",
+        default_yes=True
     )
-    if not use_auto:
+    if not use_default:
         console.print(f"\n[yellow]✏️  Откройте файл config.yaml для ручной настройки.[/yellow]")
-        console.print(f"   После редактирования запустите повторно:")
+        console.print(f"   После редактирования запустите визард повторно.")
         console.print(f"   [bold]python -m cloaker[/bold]")
-        return False
+        return True
 
     # Финальное подтверждение запуска
     output_path = resolve_output_path(dump_path, config)
-    proceed = Confirm.ask(
+    proceed = ask_yes_no(
         f"\n▶ Запустить анонимизацию?\n"
         f"   Вход:   {dump_path.name}\n"
         f"   Выход:  {output_path.name}",
-        default=True
+        default_yes=True
     )
     if not proceed:
-        console.print("\n[yellow]Отменено пользователем.[/yellow]")
-        return False
+        console.print("\n[yellow]Отменено пользователем — входной и выходной файлы не менялись.[/yellow]")
+        return True   # намеренная остановка, не сбой
 
     # ── Шаг 4: Запуск санитайзинга с живым прогрессом ───────────
     console.print("\n[bold green]═══ Шаг 4/4: Запуск обработки ═══[/bold green]\n")
@@ -273,6 +346,11 @@ def run_interactive_wizard(examples_dir: Path, config_path: Path) -> bool:
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠  Прервано пользователем[/yellow]")
         return False
+    except DumpNotAnonymizable as e:
+        console.print(f"\n[red]❌ Дамп не обезличен:[/red] {e}")
+        console.print("[dim]Файл выхода не создавался (или удалён). "
+                      "Выход — код возврата 1.[/dim]")
+        return False
     except Exception as e:
         console.print(f"\n[red]❌ Ошибка процесса: {e}[/red]")
         console.print(f"[dim]{type(e).__name__}[/dim]")
@@ -303,6 +381,9 @@ def run_batch_mode(input_path: str, output_path: Optional[str], config_path: str
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠ Interrupted[/yellow]")
+        return False
+    except DumpNotAnonymizable as e:
+        console.print(f"\n[red]❌ Дамп не обезличен:[/red] {e}")
         return False
     except Exception as e:
         console.print(f"\n[red]❌ Error: {e}[/red]")
@@ -354,6 +435,12 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--wizard", "-w",
+        action="store_true",
+        help="Явный запуск интерактивного мастера (он и так режим по умолчанию; "
+             "флаг принят, потому что обещан в README)"
+    )
+    parser.add_argument(
         "--batch", "-b",
         metavar="FILE",
         help="Batch mode: sanitize FILE without wizard prompts"
@@ -387,7 +474,18 @@ def main() -> None:
         console.print(f"[red]❌ Папка examples/ не найдена: {examples_dir}[/red]")
         sys.exit(1)
 
-    success = run_interactive_wizard(examples_dir, config_path)
+    try:
+        success = run_interactive_wizard(examples_dir, config_path)
+    except DumpNotAnonymizable as e:
+        console.print(f"\n[red]❌ Дамп не обезличен:[/red] {e}")
+        sys.exit(1)
+    except Exception as e:
+        # Мастер запускается человеком в терминале: вместо traceback'а посреди
+        # шага — понятный текст и ненулевой код возврата.
+        console.print(f"\n[red]❌ Мастер прервался:[/red] {type(e).__name__}: {e}")
+        console.print("[dim]Тем же дампом, но без вопросов: "
+                      "python -m cloaker --batch <файл.sql>[/dim]")
+        sys.exit(1)
     sys.exit(0 if success else 1)
 
 

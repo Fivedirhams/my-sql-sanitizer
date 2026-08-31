@@ -2,14 +2,97 @@
 
 from __future__ import annotations
 
+import codecs
 import re
+import time
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 from cloaker.config import CloakDBConfig
 from cloaker.cache import GlobalMappingRegistry
 from cloaker.transformers import get_transformer
 
+
+# ── Кодировка входного дампа ────────────────────────────────────
+_SNIFF_BYTES = 1 << 20          # 1 MiB заголовка достаточно, чтобы определить чарсет
+_ENC_ALIASES = {
+    "utf8": "utf-8", "utf-8": "utf-8", "utf8mb4": "utf-8", "utf8mb3": "utf-8",
+    "latin1": "cp1252", "latin": "cp1252", "iso-8859-1": "cp1252",
+    "cp1251": "cp1251", "windows-1251": "cp1251", "1251": "cp1251",
+    "koi8-r": "koi8-r", "cp866": "cp866", "maccyr": "mac-cyrillic",
+}
+
+
+def normalize_encoding(name: str):
+    """Имя чарсета из заголовка дампа -> имя для open(). None, если такого нет."""
+    if not name:
+        return None
+    key = name.strip().lower().replace("_", "-")
+    if key in _ENC_ALIASES:
+        return _ENC_ALIASES[key]
+    try:
+        return codecs.lookup(name).name
+    except LookupError:
+        return None
+
+
+def _decodes(data: bytes, enc: str) -> bool:
+    """Декодируется ли кусок без ошибок — с поправкой на обрезанный символ на конце.
+
+    Срез по _SNIFF_BYTES почти всегда приходит в середину многобайтового символа,
+    и наивный decode выдал бы UnicodeDecodeError на валидном UTF-8 дампе.
+    """
+    try:
+        data.decode(enc)
+        return True
+    except UnicodeDecodeError as e:
+        compact = enc.lower().replace("-", "")
+        return compact.startswith("utf8") and e.start >= len(data) - 4
+
+
+def detect_sql_encoding(path) -> str:
+    """Кодировка дампа: подсказка из заголовка, иначе последовательная эвристика.
+
+    mysqldump пишет в шапку `SET NAMES 'cp1251'` и `DEFAULT CHARSET=...`, а для
+    старых русских баз cp1251 — норма. Раньше профиль читался вообще без encoding
+    (то есть по локали контейнера: в образе с LANG=C там ascii), а поток — жёстко
+    по utf-8, и не-UTF-8 дамп ронял мастер на шаге 2 с UnicodeDecodeError.
+    """
+    with open(path, "rb") as f:
+        head = f.read(_SNIFF_BYTES)
+    text = head.decode("latin-1", "replace")
+    for pat in (r"SET\s+NAMES\s+'?([A-Za-z0-9_-]+)'?",
+                r"DEFAULT\s+CHARSET\s*=\s*'?([A-Za-z0-9_-]+)",
+                r"--\s*Charset:\s*([A-Za-z0-9_-]+)"):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            enc = normalize_encoding(m.group(1))
+            if enc and _decodes(head, enc):
+                return enc
+    for enc in ("utf-8", "cp1251", "koi8-r", "cp1252"):
+        if _decodes(head, enc):
+            # BOM — единственный случай, когда стоит соврать «как есть»: utf-8-sig
+            # декодирует и обычный ASCII, поэтому проверять нужно именно байты BOM,
+            # а не порядок попыток декодирования.
+            if enc == "utf-8" and head.startswith(b"\xef\xbb\xbf"):
+                return "utf-8-sig"
+            return enc
+    return "latin-1"     # декодирует любые байты — лучше, чем бить на полфайла
+
+
+def writer_encoding(read_encoding: str) -> str:
+    """В выходной дампер BOM не нужен: utf-8-sig при записи превращаем в utf-8."""
+    return "utf-8" if read_encoding == "utf-8-sig" else read_encoding
+
+
+class DumpNotAnonymizable(RuntimeError):
+    """Да́мп не поддаётся анонимизации — и потому не годится на выход.
+
+    Отдельный класс, чтобы CLI падал с кодом 1, а не печатал «✅ Done!»: раньше
+    файл без CREATE TABLE (типичная выгрузка `mysqldump --no-create-info`) проходил
+    с нулём найденных полей и нулём обработанных строк, и на выход уходил
+    оригинальный дамп с настоящими персональными данными.
+    """
 
 class SQLProcessor:
     """Stream processor for MySQL dumps with custom transformers.
@@ -22,6 +105,10 @@ class SQLProcessor:
     Cross-table consistency: GlobalMappingRegistry ensures identical source values
     produce identical masked values across ALL tables/columns.
     """
+
+    # Значение по умолчанию нужно для прямых вызовов вне process_file — например,
+    # шаг 2 мастера читает профиль сразу после создания SQLProcessor.
+    _dump_encoding: str = "utf-8"
 
     def __init__(self, config: CloakDBConfig) -> None:
         self.config = config
@@ -42,17 +129,33 @@ class SQLProcessor:
         in_path = Path(input_path)
         out_path = Path(output_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Кодировка определяется один раз по входу и та же используется для выхода,
+        # чтобы дамп импортировался в тот же чарсет, из которого был выгружен.
+        self._dump_encoding = detect_sql_encoding(in_path)
+        if self._dump_encoding not in ("utf-8", "utf-8-sig"):
+            print(f"  ℹ️  Дамп в кодировке {self._dump_encoding} — читаю и пишу в ней же")
         
         # Try loading existing global mappings from previous run
         mapping_file = str(out_path.parent / "global_mapping.json")
         if self.reg.load_from_file(mapping_file):
-            print(f"  🔄 Loaded {len(self.reg._mapping)} pre-existing mappings from {mapping_file}")
+            print(f"  🔄 Loaded {self.reg.total_entries} pre-existing mappings "
+                  f"(global + по областям колонок) from {mapping_file}")
         
         # Phase 1: Collect ALL unique samples (no limit)
         print("[1/4] Collecting all unique value samples...")
         samples = self._collect_samples(str(in_path))
         total_unique = sum(len(v) for v in samples.values())
         print(f"  Found {len(samples)} fields, {total_unique} total unique values")
+
+        # Fail-closed: ноль найденных полей означает, что разбиратель не увидел ни
+        # одного `INSERT INTO tbl (cols) VALUES` — типично для выгрузки без DDL
+        # (`mysqldump --no-create-info`). Молча писать в выход входной дамп с
+        # настоящими персональными данными — худший из возможных исходов.
+        if not samples:
+            raise DumpNotAnonymizable(
+                f"В {in_path.name} не найдено ни одного столбца для анонимизации "
+                f"(нет `INSERT INTO ... (список столбцов) VALUES` — например, дамп "
+                f"без DDL/`--no-create-info`). Файл НЕ анонимизирован.")
         
         # Phase 2: Load ALL LLM mappings (chunked batch calls sized by prompt budget)
         print("[2/4] Loading transformation mappings via LLM...")
@@ -61,17 +164,30 @@ class SQLProcessor:
         # Save global mappings for future runs
         try:
             self.reg.save_to_file(mapping_file)
-            print(f"  💾 Saved {len(self.reg._mapping)} global mappings")
+            print(f"  💾 Saved {self.reg.total_entries} mappings "
+                  f"({len(self.reg._mapping)} глобальных + "
+                  f"{sum(len(v) for v in self.reg._scoped.values())} по областям)")
         except Exception as e:
             print(f"  ⚠️ Could not save mappings: {e}")
         
         # Phase 3: Stream through dump with active transformers
         print(f"[3/4] Streaming anonymized output to {out_path}...")
         row_count = self._stream_transform(in_path, out_path, transformers)
+
+        if row_count == 0:
+            # Выход уже записан и это тот же дамп, что пришёл: удаляем, чтобы его
+            # никто не забрал как «анонимизированный», и падаем с ненулевым кодом.
+            out_path.unlink(missing_ok=True)
+            raise DumpNotAnonymizable(
+                f"Не обработано ни одной строки из {in_path.name} — выход удалён, "
+                f"данные не обезличены. Проверьте, что дамп содержит INSERT "
+                f"по таблицам, объявленным в CREATE TABLE.")
         
         print(f"\n✅ Done! Output: {out_path}")
         print(f"   Processed {row_count} rows")
-        print(f"   Global replacements cached: {len(self.reg._mapping)}")
+        print(f"   Replacements cached: {self.reg.total_entries} "
+              f"(глобально {len(self.reg._mapping)}, в областях колонок "
+              f"{sum(len(v) for v in self.reg._scoped.values())})")
         
         return row_count
     
@@ -100,7 +216,7 @@ class SQLProcessor:
         current_table = None
         current_columns: list = []
         
-        with open(sql_path) as f:
+        with open(sql_path, encoding=self._dump_encoding) as f:
             for line in f:
                 stripped = line.strip()
                 
@@ -289,6 +405,20 @@ class SQLProcessor:
     
     # ── Phase 2: Load LLM mappings ─────────────────────────────────────
     
+    def _explicit_rule(self, table: str, column: str, field_key: str) -> Optional[str]:
+        """Явное правило из config.yaml для поля.
+
+        В конфиге ключи пишутся `Table.Column`, а внутри движка поле — это
+        `Table_Column`. Поиск шёл прямым сравнением по внутреннему ключу, поэтому
+        ни одно из 39 правил конфига не совпадало, и поля, которым предписан
+        дешёвый локальный `genre` (Genre.Name, MediaType.Name, ...), уезжали в
+        платную LLM-ветку `name`.
+        """
+        rules = self.config.transform_rules
+        if not rules:
+            return None
+        return rules.get(f"{table}.{column}") or rules.get(field_key)
+
     def _load_all_mappings(
         self, samples: Dict[str, list]
     ) -> Dict[str, Any]:
@@ -299,6 +429,8 @@ class SQLProcessor:
         transformers: Dict[str, Any] = {}
         loaded = 0
         skipped = 0
+        t_start = time.monotonic()
+        total_fields = len(samples)
         
         for field_key, items in samples.items():
             parts = field_key.split('_', 1)
@@ -319,7 +451,7 @@ class SQLProcessor:
                 continue
             
             # Check for explicit transform rule
-            explicit_rule = self.config.transform_rules.get(field_key)
+            explicit_rule = self._explicit_rule(table, column, field_key)
             if explicit_rule:
                 transformer_type = explicit_rule
             else:
@@ -337,14 +469,19 @@ class SQLProcessor:
                 transformers[field_key] = transformer
                 loaded += 1
                 
-                if loaded % 5 == 0 or loaded <= 3:
-                    print(f"  [{loaded}] {field_key} ({transformer_type}): {len(transformer._mapping)} entries")
+                # Пишем по каждому полю и с таймером: раньше печать шла раз на 5
+                # полей, и шаг 4 выглядел зависшим на десятки минут.
+                print(f"  [{loaded + skipped}/{total_fields}] {field_key} "
+                      f"({transformer_type}): {len(transformer._mapping)} маппингов, "
+                      f"{time.monotonic() - t_start:.0f} с с начала")
                 
             except Exception as e:
                 # str(e)[:200]: стандартное сообщение subprocess.TimeoutExpired
                 # включает команду целиком — с заголовком Authorization и ключом.
                 detail = " ".join(str(e).split())[:200]
-                print(f"  [WARN] Failed to load {field_key}: {type(e).__name__}: {detail}")
+                print(f"  [{loaded + skipped}/{total_fields}] ⚠️  {field_key}: "
+                      f"{type(e).__name__}: {detail} — пропуск, {time.monotonic() - t_start:.0f} с"
+                      )
                 skipped += 1
         
         print(f"\n  Loaded mappings: {loaded}, Skipped (PK/FK/<2 samples): {skipped}")
@@ -427,7 +564,7 @@ class SQLProcessor:
                 continue
             
             # Check explicit config rule first
-            explicit_rule = self.config.transform_rules.get(field_key)
+            explicit_rule = self._explicit_rule(table, column, field_key)
             transformer_type = explicit_rule or self._auto_select_transformer(column, table, items)
             
             # Get sample stats
@@ -442,7 +579,7 @@ class SQLProcessor:
             elif transformer_type == 'phone' and is_numeric:
                 phone_count = sum(1 for v in values if re.match(phone_pattern, v))
                 note = f"{phone_count} phone-like"
-            elif transformer_type in ('genre', 'crm_status'):
+            elif transformer_type == 'genre':
                 unique_count = len(set(values))
                 note = f"{unique_count} unique → deterministic swap"
             
@@ -473,10 +610,12 @@ class SQLProcessor:
         if has_at:
             return "email"
         
-        # 2. Business IDs — deterministic checksum generation (INN/KPP/OGRN/passport)
-        business_id_patterns = ('inn', 'kpp', 'ogrn', 'passport', 'contract', 'vat', 'tax_id', 'registration', 'document')
+        # 2. Регистрационные и налоговые номера — не трогаем совсем. Менять их
+        # можно только генератором с контрольной суммой (ИНН/КПП/ОГРН), а он был
+        # нужен единственной базе с русскими реквизитами, которая из проекта убрана.
+        business_id_patterns = ('inn', 'kpp', 'ogrn', 'passport', 'vat', 'tax_id')
         if any(p in col_lower for p in business_id_patterns):
-            return "id_guardian"
+            return "skip"
         
         # 3. Dates — YYYY-MM-DD / YYYY/MM/DD (with separators) OR YYYYMMDD (exactly 8 digits)
         # Strict mode prevents false positives on long numeric IDs like '3570236' (bytes)
@@ -557,13 +696,13 @@ class SQLProcessor:
         if 'currency' in col_lower or col_lower in ('code', 'iso_code'):
             return "genre"
         
-        # 14. CRM status/stage/terms/method/payment_type
+        # 14. Статусы/этапы/условия оплаты — замкнутое перечисление, циклическая замена
         if any(p in col_lower for p in ('status', 'stage', 'terms', 'method', 'payment_type')):
-            return "crm_status"
+            return "genre"
         
-        # 15. Lead source / marketing channel
+        # 15. Источник лида / маркетинговый канал — тоже замкнутое перечисление
         if any(p in col_lower for p in ('leadsource', 'lead_source', 'marketing', 'campaign', 'referral')):
-            return "crm_status"
+            return "genre"
         
         # ═══ PHASE D: Skip decisions ═══
         
@@ -609,9 +748,9 @@ class SQLProcessor:
         if 'currency' in col_lower or col_lower in ('code', 'iso_code'):
             return "genre"  # Cyclic swap (USD, EUR, RUB — only few unique values)
         
-        # LeadSource / marketing_source — business enum
+        # Источник лида / маркетинговый канал — замкнутое перечисление
         if any(p in col_lower for p in ('leadsource', 'lead_source', 'marketing', 'campaign', 'referral')):
-            return "crm_status"  # Cyclic swap
+            return "genre"  # Cyclic swap
         
         # Website/URL — contains domain which has emails
         if 'website' in col_lower or 'url' in col_lower or 'domain' in col_lower:
@@ -625,9 +764,9 @@ class SQLProcessor:
         if any(p in col_lower for p in ('genre', 'media_type', 'playlist', 'type', 'category')):
             return "genre"
         
-        # CRM status/stage/terms/method — enum-like fields
+        # Статусы/этапы/способы оплаты — замкнутое перечисление
         if any(p in col_lower for p in ('status', 'stage', 'terms', 'method', 'payment_type')):
-            return "crm_status"  # Cyclic swap
+            return "genre"  # Cyclic swap
         
         # Default fallback
         return "genre"
@@ -656,7 +795,12 @@ class SQLProcessor:
         current_columns: list = []
         in_insert = False
         
-        with open(in_path) as fin, open(out_path, 'w') as fout:
+        # Ввод/вывод в кодировке дампа (см. detect_sql_encoding): жёсткий utf-8
+        # ронял мастер на cp1251-выгрузках, а чтение без encoding зависело от
+        # локали контейнера. Выход — в той же кодировке, чтобы IMPORT не сломался.
+        enc = self._dump_encoding
+        with open(in_path, encoding=enc) as fin, \
+                open(out_path, 'w', encoding=writer_encoding(enc)) as fout:
             for line in fin:
                 stripped = line.strip()
                 
@@ -687,19 +831,24 @@ class SQLProcessor:
                 # If inside INSERT VALUES section, process this line
                 if current_table and current_columns:
                     if stripped.startswith('('):
+                        # ВАЖНО: передаём исходную строку целиком (включая перевод
+                        # строки), а не stripped() — иначе теряется хвостовая
+                        # запятая между кортежами и `\n`, и INSERT склеивается.
                         processed = self._process_value_line(
-                            stripped, current_table, current_columns, table_transformers
+                            line, current_table, current_columns, table_transformers
                         )
                         if processed is not None:
                             row_count += 1
                             fout.write(processed)
-                            
-                            # End of INSERT? Line ends with ); or standalone );
-                            if stripped.rstrip().endswith(');'):
-                                in_insert = False
-                                current_table = None
-                                current_columns = []
-                            continue
+                        else:
+                            fout.write(line)
+
+                        # Конец INSERT? (терминальный `);` в исходной строке)
+                        if stripped.endswith(');'):
+                            in_insert = False
+                            current_table = None
+                            current_columns = []
+                        continue
                 
                 fout.write(line)
         
@@ -709,94 +858,261 @@ class SQLProcessor:
         self, line: str, table: str, columns: list,
         table_tx: Dict[str, Dict[str, Any]]
     ) -> Optional[str]:
-        """Transform a single value line like "(1, 'Rock')," or "(2, 'Jazz');"."""
-        ends_semi = line.rstrip().endswith(');')
-        
-        tuples = self._extract_value_tuples(line)
-        if not tuples:
+        """Трансформация строки VALUES заменой значений ПО ПОЗИЦИЯМ.
+
+        Ключевое отличие от прежней реализации: исходная строка служит
+        шаблоном, в котором перезаписываются только токены значений.
+        Разделители между кортежами (`,`), переводы строк, терминальный `;`,
+        кавычки, префиксы `N'..'`, экранирование и отступы сохраняются
+        дословно — пересобрать INSERT с потерей структуры, как делал старый
+        код (`"(".join`, `sep = ",\\n" if len>1 else " "`, `+ ");"`), теперь
+        невозможно в принципе.
+
+        Возвращает None, если кортежей в строке нет (тогда строка пишется как есть).
+        """
+        spans = self._iter_tuple_spans(line)
+        if not spans:
             return None
-        
-        new_tuples = []
-        
-        for tuple_str in tuples:
-            vals = self._parse_values_tuple(tuple_str)
-            new_vals = []
-            
-            for i, val in enumerate(vals):
-                # Bounds check
-                if i >= len(columns):
-                    new_vals.append(self._safe_sql_val(val))
+
+        pieces: List[str] = []
+        pos = 0
+        for start, end in spans:
+            pieces.append(line[pos:start])          # текст между кортежами — как в оригинале
+            pieces.append(self._process_tuple(
+                line[start:end], table, columns, table_tx))
+            pos = end
+        pieces.append(line[pos:])                   # хвост: ',', ';' и перевод строки
+        return "".join(pieces)
+
+    # ── Разбор SQL-строки с учётом кавычек и экранирования ─────────────
+
+    @staticmethod
+    def _skip_quoted(s: str, i: int) -> int:
+        """i указывает на открывающую кавычку. Вернуть индекс за закрывающей.
+
+        Учтены оба способа экранирования: удвоение ('') и обратный слэш (\').
+        """
+        quote = s[i]
+        n = len(s)
+        i += 1
+        while i < n:
+            ch = s[i]
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < n and s[i + 1] == quote:
+                    i += 2
                     continue
-                
-                column = columns[i]
-                
-                # Skip PK/FK — preserve integrity  
-                if self._is_skip_column(column):
-                    new_vals.append(self._safe_sql_val(val))
-                    continue
-                
-                # Look up transformer in nested tx_map
-                tx_map = table_tx.get(table, {})
-                transformer = tx_map.get(column)
-                
-                raw = val.strip()
-                
-                # Extract the actual data value from SQL representation
-                if raw.startswith("N'"):
-                    inner = raw[2:]  # strip N prefix
-                elif raw.startswith("'"):
-                    inner = raw[1:]
-                else:
-                    inner = raw
-                
-                # Strip surrounding quotes
-                data = inner.strip(chr(39) + chr(34))
-                # Unescape doubled quotes 
-                data = data.replace("''", "'")
-                
+                return i + 1
+            i += 1
+        return n                                    # незакрытая кавычка
+
+    @classmethod
+    def _match_paren(cls, s: str, start: int) -> int:
+        """Индекс за парной закрывающей скобкой для s[start] == '(' или -1."""
+        depth = 0
+        i = start
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch in ("'", '"', '`'):
+                i = cls._skip_quoted(s, i)
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return -1
+
+    @classmethod
+    def _iter_tuple_spans(cls, line: str) -> List[Tuple[int, int]]:
+        """Список (start, end) всех кортежей (…) в строке; end — исключительно.
+
+        `)` внутри строкового значения (например 'Blues (Live)') кортеж не закрывает.
+        """
+        spans: List[Tuple[int, int]] = []
+        i = 0
+        n = len(line)
+        while i < n:
+            if line[i] != '(':
+                i += 1
+                continue
+            end = cls._match_paren(line, i)
+            if end == -1:
+                break                               # незакрытый кортеж — остаток не трогаем
+            spans.append((i, end))
+            i = end
+        return spans
+
+    @classmethod
+    def _split_top_level(cls, inner: str) -> List[Tuple[str, int, int]]:
+        """Разбить содержимое кортежа на токены значений со спаннами.
+
+        Возвращает [(текст_токена_включая_пробелы, start, end), ...] с индексами
+        внутри `inner`; разделительные запятые в токены не входят.
+        """
+        parts: List[Tuple[str, int, int]] = []
+        n = len(inner)
+        depth = 0
+        i = 0
+        token_start = 0
+        while i < n:
+            ch = inner[i]
+            if ch in ("'", '"', '`'):
+                i = cls._skip_quoted(inner, i)
+                continue
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif ch == ',' and depth == 0:
+                parts.append((inner[token_start:i], token_start, i))
+                i += 1
+                token_start = i
+                continue
+            i += 1
+        parts.append((inner[token_start:n], token_start, n))
+        return parts
+
+    # ── Трансформация кортежа и отдельного значения ───────────────────
+
+    def _process_tuple(self, tuple_text: str, table: str, columns: list,
+                       table_tx: Dict[str, Dict[str, Any]]) -> str:
+        """Перезаписать только токены значений: скобки и запятые остаются нетронутыми."""
+        if not (tuple_text.startswith('(') and tuple_text.endswith(')')):
+            return tuple_text
+        inner = tuple_text[1:-1]
+        parts = self._split_top_level(inner)
+        if not parts:
+            return tuple_text
+
+        pieces: List[str] = []
+        pos = 0
+        for idx, (token, s, e) in enumerate(parts):
+            pieces.append(inner[pos:s])
+            pieces.append(self._transform_token(token, idx, table, columns, table_tx))
+            pos = e
+        pieces.append(inner[pos:])
+        return "(" + "".join(pieces) + ")"
+
+    def _transform_token(self, token: str, idx: int, table: str, columns: list,
+                         table_tx: Dict[str, Dict[str, Any]]) -> str:
+        """Замена одного SQL-токена значения с сохранением способа его записи.
+
+        Гарантии формата:
+        * `NULL` (в любом регистре) — не данные, остаётся `NULL` (без кавычек);
+        * кавычки и префикс (`N'..'`, `'..'`, `".."`) сохраняются как в оригинале;
+        * голый токен (число) меняется ТОЛЬКО на значение того же класса, иначе
+          числовая колонка получила бы строку — это потеря типа;
+        * нет замены (или трансформер не назначен) — токен возвращается нетронутым.
+        """
+        lead = token[:len(token) - len(token.lstrip())]
+        trail = token[len(token.rstrip()):]
+        body = token.strip()
+        if not body:
+            return token
+
+        # SQL-литералы, не являющиеся данными.
+        if body.upper() in ('NULL', 'DEFAULT'):
+            return token
+
+        if idx >= len(columns):
+            return token
+        column = columns[idx]
+        if self._is_skip_column(column):
+            return token
+
+        # Разобрать представление значения.
+        prefix = suffix = ''
+        if len(body) >= 3 and body.startswith("N'") and body.endswith("'"):
+            prefix, suffix, literal = "N'", "'", body[2:-1]
+        elif len(body) >= 2 and body[0] == "'" and body[-1] == "'":
+            prefix, suffix, literal = "'", "'", body[1:-1]
+        elif len(body) >= 2 and body[0] == '"' and body[-1] == '"':
+            prefix, suffix, literal = '"', '"', body[1:-1]
+        else:
+            literal = body                                  # голый литерал (число и т. п.)
+
+        quoted = bool(prefix)
+        data = self._unescape_sql(literal) if quoted else body
+
+        tx_map = table_tx.get(table, {})
+        transformer = tx_map.get(column)
+        if transformer is None:
+            return token
+
+        replacement = None
+        if getattr(transformer, '_mapping', None):
+            replacement = transformer._mapping.get(data)
+        if replacement is None and hasattr(transformer, 'transform'):
+            try:
+                replacement = transformer.transform(data, table=table, column=column)
+            except Exception:
                 replacement = None
-                
-                # Try mapping lookup first (LLM-based transformers)
-                if transformer and transformer._mapping:
-                    replacement = transformer._mapping.get(data)
-                
-                # Fallback: use transform() method for stateless transformers
-                # (IDGuardian, Phone, Email without LLM cache, etc.)
-                if replacement is None and transformer and hasattr(transformer, 'transform'):
-                    try:
-                        replacement = transformer.transform(data, table=table, column=column)
-                    except Exception:
-                        pass  # Transform failed — will preserve original
-                
-                if replacement is not None:
-                    # Detect original quote style
-                    prefix = "N'" if raw.startswith("N'") else "'" if raw.startswith("'") else ""
-                    
-                    if prefix:
-                        safe = replacement.replace("'", "''")
-                        new_vals.append(prefix + safe + "'")
-                    else:
-                        new_vals.append(replacement)
-                    continue
-                
-                # No transformation — preserve original
-                new_vals.append(self._safe_sql_val(val))
-            
-            new_tuples.append("(" + ",".join(new_vals) + ")")
-        
-        # Preserve indentation
-        m = re.match(r"^(\s+)", line)
-        indent = m.group(1) if m else ""
-        
-        # Join with proper separator
-        sep = ",\n" if len(new_tuples) > 1 else " "
-        result = sep.join(indent + t for t in new_tuples)
-        
-        if ends_semi:
-            result += ");"
-        
-        return result
-    
+
+        if replacement is None:
+            return token
+        replacement = str(replacement)
+        if replacement == data:
+            return token
+
+        if quoted:
+            return f"{lead}{prefix}{self._escape_sql(replacement, prefix)}{suffix}{trail}"
+
+        if not self._same_literal_class(body, replacement):
+            return token                                  # не ломать тип колонки
+        return f"{lead}{replacement}{trail}"
+
+    @staticmethod
+    def _unescape_sql(text: str) -> str:
+        """Тело SQL-литерала → исходное значение ('' и \\' → ', \\n → перевод строки)."""
+        out: List[str] = []
+        i = 0
+        n = len(text)
+        escapes = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0',
+                   '\\': '\\', "'": "'", '"': '"', 'b': '\b', 'Z': '\x1a'}
+        while i < n:
+            ch = text[i]
+            if ch == '\\' and i + 1 < n:
+                out.append(escapes.get(text[i + 1], text[i + 1]))
+                i += 2
+                continue
+            if ch == "'" and i + 1 < n and text[i + 1] == "'":
+                out.append("'")
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _escape_sql(value: str, prefix: str) -> str:
+        """Исходное значение → тело литерала в том же стиле кавычки.
+
+        Удвоение кавычки валидно для MySQL независимо от sql_mode (в отличие от
+        обратной косой черты при NO_BACKSLASH_ESCAPES).
+        """
+        if prefix.endswith("'"):
+            return value.replace("'", "''")
+        return value.replace('"', '""')
+
+    _NUM_LITERAL = re.compile(r'^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$')
+    _DATE_LITERAL = re.compile(r'^\d{4}-\d{2}-\d{2}')
+
+    @classmethod
+    def _same_literal_class(cls, original: str, replacement: str) -> bool:
+        """Одного ли SQL-класса значения: число ↔ число той же разрядности."""
+        if cls._NUM_LITERAL.match(original):
+            return (bool(cls._NUM_LITERAL.match(replacement))
+                    and len(replacement) == len(original))
+        if cls._DATE_LITERAL.match(original):
+            return bool(cls._DATE_LITERAL.match(replacement))
+        return False
+
     @staticmethod
     def _safe_sql_val(raw: str) -> str:
         """Return raw SQL value cleanly stripped."""

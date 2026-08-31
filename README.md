@@ -19,7 +19,7 @@ python3 -m cloaker
 ```
 
 Мастер проходит через 4 этапа:
-1. **Выбор базы** — список доступных `.sql` файлов в `examples/`
+1. **Выбор базы** — список доступных `.sql` файлов в `examples/`. В поставке одна демо-база (`chinook_test.sql`), она подставляется по умолчанию; свой дамп просто кладётся в `examples/`
 2. **Сканирование** — сбор ВСЕХ уникальных значений каждого поля (без ограничений!)
 3. **Проверка конфигурации** — автоклассификация полей + маппинг к трансформерам
 4. **Запуск обработки** — анонимизация с индикатором прогресса
@@ -61,7 +61,7 @@ docker compose run --rm cloakdb --batch /input/dump.sql   # Batch mode
 ### Фаза 2: Загрузка маппингов (LLM + детерминированные)
 
 - **LLM-поля** (`name`, `address`, `company`, `composer`, `title`): собираем уникальные значения → отправляем запросом с чанкингом → получаем JSON `{оригинал: замена}` → сохраняем в `GlobalMappingRegistry`
-- **Детерминированные поля** (`email`, `phone`, `postal_code`, `genre`, `crm_status`, `date_shuffle`, `id_guardian`, `skip`): маппинги вычисляются мгновенно на клиенте через SHA256 или циклический swap — **ни одного сетевого вызова**
+- **Детерминированные поля** (`email`, `phone`, `postal_code`, `genre`, `date_shuffle`, `skip`): маппинги вычисляются мгновенно на клиенте через SHA256 или циклический swap — **ни одного сетевого вызова**
 
 **Экономия LLM-вызовов:** email, phone и postal_code теперь обрабатываются локально. Для Chinook (~15K строк) это экономит ~12 API-запросов за один дамп.
 
@@ -85,9 +85,7 @@ transforms:
   Customer.Email: email          # Почты → SHA256 hash (ZERO LLM)
   Customer.Phone: phone          # Телефоны → format-preserving (ZERO LLM)
   Artist.Name: name              # Имена музыкантов → LLM реалистичные
-  deals.Stage: crm_status        # Статусы сделок → циклическая замена
   Genre.Name: genre              # Жанры → циклическая замена
-  companies.Inn: id_guardian     # ИНН → детерминированный генератор
 ```
 
 Формат: `ИмяТаблицы.ИмяКолонки` → идентификатор трансформера. Если правило не найдено — срабатывает автодетект.
@@ -102,9 +100,7 @@ transforms:
 | Цифры ≥7 | `phone` | `Employee.Phone` |
 | Название содержит `name`, `firstname` | `name` | `Artist.Name` |
 | Название содержит `city`, `country` | `genre` (цикл) | `Customer.City` |
-| Название содержит `status`, `stage` | `crm_status` (цикл) | `contacts.Status` |
 | Название содержит `address` | `address` (LLM) | `Customer.Address` |
-| Бизнес-коды: `inn`, `kpp`, `ogrn`, `passport` | `id_guardian` (checksums) | `companies.Inn` |
 | Название содержит `title` | `title` (LLM) | `JobTitle` |
 | Числовые поля (`price`, `total`, `quantity`) | `skip` | `Invoice.Total` |
 | Колонки `_id` или `Id` | `skip` | `CustomerId` |
@@ -115,14 +111,12 @@ transforms:
 
 ## 🔄 Алгоритмы трансформеров (полный справочник)
 
-Все 13 типов трансформеров:
+Все 12 типов трансформеров:
 
 | Тип файла | Идентификатор в конфиге | Логика | Требуется LLM? |
 |-----------|------------------------|--------|----------------|
 | `genre_transformer.py` | `genre` | Циклический swap значений | ❌ Нет |
-| `crm_status_transformer.py` | `crm_status` | Циклический swap статусов | ❌ Нет |
 | `date_transformer.py` | `date_shuffle_month`, `date_shuffle_year` | Математический шифр дат | ❌ Нет |
-| `id_guardian_transformer.py` | `id_guardian` | Генерация ИНН/OGRN/KPP с checksums | ❌ Нет |
 | `email_transformer.py` | `email` | Детерминированный hash → реалистичное имя, домен сохраняется | ❌ Нет |
 | `phone_transformer.py` | `phone` | Format-preserving замена цифр (последние 3-4), формат скобок/дефисов сохраняется | ❌ Нет |
 | `name_transformer.py` | `name` | LLM реалистичные имена | ✅ Да |
@@ -153,20 +147,6 @@ transforms:
 | `Name` | Genre, MediaType, Playlist | Жанры музыки — плейлисты |
 | `PostalCode` | BillingAddress | Почтовый индекс — сохранить формат XXXXX |
 
-### `CRMStatusTransformer` (crm_status) — циклический swap статусов
-
-Те же принципы что и genre, но для бизнес-полей со специфичными значениями. Сохраняет формат (case, пробелы).
-
-**Когда использовать:** любые enum/stage/terms columns.
-
-| Поле | Таблица | Зачем |
-|------|---------|-------|
-| `Status` | Contacts | new/won/lost/on_hold → цикл |
-| `Stage` | Deals | prospect/negotiation/closed |
-| `Terms` | Payments | Net 30, Cash on Delivery |
-| `Method` | Invoices | cash/credit/bank_transfer |
-| `Inn/Ogrn/Kpp` | Companies | юр. реквизиты → теперь `id_guardian` |
-
 ### `DateShuffleTransformer` (date_shuffle_month / date_shuffle_year)
 
 Математическое перемещение даты. Не ломает возрастную статистику:
@@ -179,36 +159,6 @@ transforms:
 | `HireDate` | Employee | month (сохраняем период найма) |
 | `BirthDate` | Employee | year (сохраняем возраст) |
 | `InvoiceDate` | Invoice | days (±30 дней — не важно для аналитики) |
-
-### `IDGuardianTransformer` — детерминированный генератор российских бизнес-идентификаторов
-
-Новый трансформер для INN, KPP, OGRN, паспортов, контрактов. Генерирует РЕАЛЬНО ВАЛИДНЫЕ номера с правильными контрольными суммами. LLM тут категорически не подходит — он модульную арифметику не считает.
-
-**Принцип работы:** берёт длину оригинала → определяет тип → генерирует случайные цифры с правильной формулой контрольной суммы.
-
-#### Формулы контрольных сумм:
-
-| Документ | Длина | Формула |
-|----------|-------|---------|
-| ИНН юрлица | 10 цифр | Первая девятка × [3,7,2,4,10,3,5,9,6] mod 11, остаток % 10 → десятая цифра |
-| ИНН ИП | 12 цифр | Две контрольные с разными весами |
-| ОГРН | 13 цифр | Первые 9 цифр × [2,4,10,3,5,9,4,6,8] mod 11 |
-| КПП | 9 цифр | Произвольная комбинация допустимых символов |
-| Паспорт РФ | XXXX XXXXXX | Серия (4 цифры, первая 4–9), номер (6 цифр) |
-
-| Где применять | Примеры полей |
-|---------------|---------------|
-| ИНН компании | `companies.Inn` |
-| КПП | `companies.Kpp` |
-| ОГРН | `companies.Ogrn` |
-| Номер паспорта | `contacts.PassportNumber` |
-| Договоры | `contracts.Number` |
-
-**Пример работы:**
-```
-Input:  companies.Inn = "7707083893" (ИНН ЮЛ)
-Output: "5925389347" (валидный ИНН с правильной контрольной)
-```
 
 ### `EmailTransformer` (email) — детерминированный, ZERO LLM
 
@@ -255,7 +205,7 @@ Hash-алгоритм (SHA256) генерирует замену, сохраня
 | Где применять | Примеры полей |
 |---------------|---------------|
 | Почтовые индексы | `Customer.PostalCode`, `BillingAddress.PostalCode` |
-| Индексы адресов | `Employee.ZipCode`, `contracts.MailZip` |
+| Индексы адресов | `Employee.PostalCode`, `Invoice.BillingPostalCode` |
 
 ---
 
@@ -295,7 +245,7 @@ Parameters:
 
 Названия организаций масштаба региона оригинала.
 
-**Где применять:** `Customer.Company`, `companies.CompanyName`
+**Где применять:** `Customer.Company`
 
 **Формат запроса к LLM:**
 ```
@@ -303,14 +253,14 @@ USER PROMPT:
 Field: {field_key}
 Replace each company name with a realistic alternative company name.
 Return JSON: {"original_company": "new_company", ...}
-Companies: "{company1}", "{company2}", "{company3}"...
+Original values ({count} total): "{company1}", "{company2}", "{company3}"...
 ```
 
 ### `AddressTransformer` (address)
 
 Новые улицы/дома/город, сохраняющие структуру адреса.
 
-**Где применять:** `Customer.Address`, `Employee.Address`, `Invoice.BillingAddress`, `companies.LegalAddress`
+**Где применять:** `Customer.Address`, `Employee.Address`, `Invoice.BillingAddress`
 
 **Формат запроса к LLM:**
 ```
@@ -368,11 +318,6 @@ transforms:
   Invoice.InvoiceDate: date_shuffle   # Даты счетов → shuffle дат
   Employee.BirthDate: date_shuffle    # Даты рождения → shuffle дат
   Employee.HireDate: date_shuffle     # Дата найма → shuffle дат
-  companies.Inn: id_guardian          # ИНН → детерминированный генератор (checksums!)
-  companies.Kpp: id_guardian          # КПП
-  companies.Ogrn: id_guardian         # ОГРН
-  contacts.Status: crm_status         # Статусы контактов → цикл
-  deals.Stage: crm_status             # Этапы сделок → цикл
 
 # Параметры обработки (глубина выборки, пути вывода, таймауты) задаются в .env:
 #   SAMPLES_PER_FIELD=50, PROFILES_DIR=output/profiles,
@@ -466,7 +411,7 @@ class GlobalMappingRegistry:
 
 ---
 
-## 📊 Примеры баз
+## 📊 Демо-база
 
 ### Chinook (музыкальный магазин)
 Стандартный тестовый дамп. Проверка основных типов полей: имена, жанры, города, телефоны, почты, даты.
@@ -475,17 +420,7 @@ class GlobalMappingRegistry:
 examples/chinook_test.sql   — 11 таблиц, ~15 000 строк, 64 поля
 ```
 
-### Business CRM (российская система управления клиентами)
-Бизнес-ориентированная база с русскоязычными данными, ИНН/KPP/OGRN, российскими телефонами и почтами.
-
-```
-examples/crm_sample.sql     — 6 таблиц: компании, контакты, сделки, платежи
-```
-
-Поддерживаемые типы для CRM:
-- Реквизиты: INN (9 цифр), KPP (9 цифр), OGRN (13 цифр) → `id_guardian` (с проверкой checksum)
-- Бизнес-статусы: `Status`, `Stage`, `Terms`, `Method` → циклическая замена (`crm_status`)
-- Город, отрасль: `City`, `Industry` → шифруются через `genre` (цикл)
+Это единственная демо-база в поставке — она подставляется в мастер по умолчанию. Свой дамп кладётся в `examples/` и появляется в списке выбора.
 
 ---
 
@@ -497,17 +432,11 @@ examples/crm_sample.sql     — 6 таблиц: компании, контакт
 - Связи между таблицами intact
 - Результат загружается обратно в MySQL без ошибок
 
-### Бизнес-идентификаторы
-Новый `IDGuardianTransformer` гарантирует что после замены:
-- Контрольная сумма ИНН остаётся валидной
-- Длина числа не меняется
-- Структура (разделители серии/номера) сохраняется
-
 ### Кросс-табличная консистентность
 Одинаковые исходные значения заменяются одинаково через `GlobalMappingRegistry`. Имя `'John'` в таблице `Customer` получит ту же замену, что и `'John'` в `Invoice` или `Employee`.
 
 ### Распределение сохраняется
-Локальные трансформеры (`genre`, `crm_status`, `date_shuffle`) сохраняют распределение значений: если город `Москва` занимал 40% строк, после обработки он тоже будет встречаться в 40%.
+Локальные трансформеры (`genre`, `date_shuffle`) сохраняют распределение значений: если город `Москва` занимал 40% строк, после обработки он тоже будет встречаться в 40%.
 
 ---
 
@@ -566,11 +495,9 @@ my-sql-sanitizer/
 │   ├── llm_client.py                     ← Клиент LLM (чанкинг, retry)
 │   ├── base_transformer.py               ← Базовый класс трансформеров
 │   └── transformers/                     ← Реализации
-│       ├── __init__.py                   ← Registry TRANSFORMER_MAP (13 типов)
+│       ├── __init__.py                   ← Registry TRANSFORMER_MAP (12 типов)
 │       ├── genre_transformer.py          ← Циклический swap (без LLM)
-│       ├── crm_status_transformer.py     ← Статусы (без LLM)
 │       ├── date_transformer.py           ← Шаффл дат (без LLM)
-│       ├── id_guardian_transformer.py    ← ИНН/OGRN/паспорта с checksum (NEW)
 │       ├── name_transformer.py           ← Имена (LLM)
 │       ├── email_transformer.py          ← Почты (SHA256, ZERO LLM)
 │       ├── phone_transformer.py          ← Телефоны (format-preserving, ZERO LLM)
@@ -581,8 +508,7 @@ my-sql-sanitizer/
 │       └── postal_code_transformer.py    ← Почтовые коды (SHA256, ZERO LLM)
 ├── config.yaml                           ← Маппинг полей к трансформерам
 ├── examples/                             ← Тестовые SQL дампы
-│   ├── chinook_test.sql                  ← Музыкальный магазин (11 табл.)
-│   └── crm_sample.sql                    ← CRM российская (6 табл.)
+│   └── chinook_test.sql                  ← Музыкальный магазин (11 табл.)
 ├── start.sh                              ← Обёртка CLI
 ├── docker-compose.yml                    ← Оркестрация
 ├── Dockerfile.cloakdb                    ← Production образ
@@ -691,8 +617,7 @@ rm -rf output/profiles/ output/global_mapping.json
 После выполнения можно проверить:
 1. **Отсутствие дублей PK** — все `*_id` сохранены без изменений
 2. **Нулевые хеш-плейсхолдеры** — никаких `"hash_abc123"` или фиктивных строк
-3. **Контрольные суммы ИНН** — если применялся `id_guardian`, все генерированные номера должны пройти валидацию
-4. **Кросс-табличная консистентность** — одинаковые значения в разных таблицах заменились одинаково
+3. **Кросс-табличная консистентность** — одинаковые значения в разных таблицах заменились одинаково
 
 ### Ручная проверка
 ```bash

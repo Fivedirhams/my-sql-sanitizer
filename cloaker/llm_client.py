@@ -20,6 +20,174 @@ class LLMTimeoutError(RuntimeError):
     """
 
 
+# ── Сохранение формата: инструкция модели и отбраковка ответа ───────────────
+
+FORMAT_RULES = """HARD FORMAT RULES — every replacement you emit must match the format
+of its original. These rules outrank «make it look realistic».
+1. Same character count as the original. Free text (names, titles): ±10% is
+   acceptable; anything with digits or separators must be EXACTLY the same length.
+2. Same alphabet: Cyrillic in → Cyrillic out, Latin in → Latin out. Transliterating
+   «Иван» into «Ivan» is a failure, not an anonymization.
+3. Same separators at the same positions: digits stay digits, letters stay letters,
+   spaces, dots, dashes, slashes and brackets stay where they were.
+4. Case pattern is preserved («Иван Петров» → both words capitalized, «J. R. Smith»
+   keeps the single letters and the dots).
+5. Emails: keep the domain byte-for-byte (with its case), change only the local part.
+6. Dates keep their template: '2024-01-15' stays 10 chars with dashes and no time
+   part; '15.03.2021' stays day-first with dots.
+7. Never output NULL, an empty string, a placeholder like 'N/A', '<anonymized>',
+   '***', and never echo the original value back.
+Output only a JSON object {"original": "replacement"}; copy every key exactly."""
+
+DATE_LIKE_RE = re.compile(r'^\d{2,4}[-/.]\d{1,2}[-/.]\d{1,2}')
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+PLACEHOLDER_RE = re.compile(
+    r'^(?:n/?a|null|none|undefined|unknown|-+|_+|\*+|\.{3}|<[^>]*>|'
+    r'аноним\w*|скрыт\w*|обфуск\w*|заглушк\w*)$', re.IGNORECASE)
+
+# поле → сколько пар отбраковано (попадает в подсказку модели на следующем чанке)
+_FORMAT_VIOLATIONS: Dict[str, int] = {}
+
+
+def _has_cyrillic(v: str) -> bool:
+    return any('\u0430' <= c.lower() <= '\u044f' for c in v)
+
+
+def _is_mask_like(v: str) -> bool:
+    """Код с фиксированной маской, а не свободный текст.
+
+    У '+7 (912) 345-67-89', 'INV-TP-001', '770701001' позиция каждого символа —
+    часть формата; у 'Руководитель закупок' позиции слов — просто текст.
+    """
+    if EMAIL_RE.match(v) or DATE_LIKE_RE.match(v):
+        return True
+    return any(c.isdigit() for c in v) and any(c in "-/. " for c in v)
+
+
+def _is_code_like(v: str) -> bool:
+    """Код фиксированной ширины (телефон, 'INV-TP-001', номер карты), а не адрес.
+
+    Раздел один: у кода длина позиции — часть формата, у 'ул. Ленина, д. 45'
+    длина названия улицы — просто длина названия. Критерий — длина самого
+    длинного буквенного запуска: у кодов это аббревиатуры по 2-3 буквы
+    (INV, TP, CR), у адресов и названий — полноценные слова.
+    """
+    runs = [m.group(0) for m in re.finditer(r'[^\W\d_]+', v, re.UNICODE)]
+    return max((len(x) for x in runs), default=0) <= 3
+
+
+def _skeleton(v: str) -> str:
+    """Структурные символы по порядку — всё, что не буквы и не цифры."""
+    return "".join(c for c in v if not c.isalnum())
+
+
+def _digit_run_widths(v: str) -> List[int]:
+    """Разряд каждой группы цифр: 'д. 45, кв. 3' -> [2, 1]."""
+    return [len(m.group(0)) for m in re.finditer(r'\d+', v)]
+
+
+# В названиях по-русски и по-английски служебные слова пишутся строчно; без
+# исключения они ломали бы проверку регистра на честных заголовках
+# ('Bohemian Rhapsody' -> 'Wave upon a Dream').
+_PARTICLES = {
+    "a", "an", "the", "of", "and", "or", "upon", "in", "on", "at", "to", "for",
+    "de", "la", "le", "du", "del", "von", "van", "di", "da",
+    "и", "в", "с", "на", "о", "у", "к", "от", "из", "для", "по", "но", "или",
+}
+
+
+def _case_violation(o: str, r: str):
+    """Регистр значимых слов сохраняется, служебные слова — исключение."""
+    wo = [w for w in re.split(r"\s+", o.strip()) if w]
+    wr = [w for w in re.split(r"\s+", r.strip()) if w]
+    if len(wo) != len(wr):
+        return None            # число слов поехало — сравнивать регистр не с чем
+    for a, b in zip(wo, wr):
+        strip = ".,()!?:;-\u00ab\u00bb\"'"
+        if a.strip(strip).lower() in _PARTICLES or b.strip(strip).lower() in _PARTICLES:
+            continue
+        if a[:1].isupper() != b[:1].isupper():
+            return "регистр слов не сохранён"
+    return None
+
+
+def format_violation(original: str, replacement: str, field: str = ""):
+    """Причина, по которой пару нельзя пускать в дамп, либо None.
+
+    Пороги разные для трёх родов значений, потому что «формат» у них разный:
+    у кода (телефон, 'INV-TP-001', индекс) позиция каждого символа — часть
+    формата; у адреса фиксирована структура ('ул. X, д. N'), а не длина; у
+    свободного текста (имена, жанры, названия) не зафиксировано почти ничего,
+    кроме алфавита, регистра и разумной длины.
+    """
+    o, r = str(original), str(replacement)
+    if not r.strip():
+        return "замена пустая"
+    if PLACEHOLDER_RE.match(r.strip()):
+        return f"заглушка вместо данных ({r.strip()[:12]!r})"
+    if r == o:
+        return "значение не изменено"
+    if _has_cyrillic(o) != _has_cyrillic(r):
+        return "сменён алфавит (кириллица<->латиница)"
+    if EMAIL_RE.match(o):
+        if not EMAIL_RE.match(r):
+            return "замена не похожа на email"
+        if o.rsplit('@', 1)[1] != r.rsplit('@', 1)[1]:
+            return "изменён домен"
+        return None if len(o) == len(r) else "длина email не сохранена"
+    if DATE_LIKE_RE.match(o):
+        if not DATE_LIKE_RE.match(r) or len(o) != len(r):
+            return "сменён шаблон даты"
+        if bool(re.search(r'\d\d:\d\d', o)) != bool(re.search(r'\d\d:\d\d', r)):
+            return "время появилось или пропало"
+        return None
+    if o.isdigit():
+        # Чистое число (почтовый индекс, код, сумма): разряд и есть формат,
+        # ведущие нули теряются именно здесь ('012345' -> '4797').
+        if not r.isdigit():
+            return "число перестало быть числом"
+        if len(o) != len(r):
+            return f"разрядность {len(o)} -> {len(r)} (ведущие нули?)"
+        return None
+    if _is_mask_like(o):
+        if not _is_code_like(o):
+            # Адрес/объект с номером: структура обязательна, длина — нет.
+            if _skeleton(o) != _skeleton(r):
+                return "пропущен структурный символ адреса"
+            if _digit_run_widths(o) != _digit_run_widths(r):
+                return "разрядность номеров не сохранена"
+            return None
+        if len(o) != len(r):
+            return f"длина маски {len(o)} -> {len(r)}"
+        for a, b in zip(o, r):
+            if a.isalnum() != b.isalnum():
+                return "буква стала разделителем (или наоборот)"
+            if a.isdigit() != b.isdigit():
+                return "цифра стала буквой (или наоборот)"
+            # Разделитель — часть формата, а не «любой не-буквенный символ»:
+            # 'INV-TP-001' -> 'INV_TP_001' перестаёт читаться парсерами кода.
+            if not a.isalnum() and a != b:
+                return f"разделитель {a!r} -> {b!r}"
+        return None
+    # Свободный текст: ширины нет, бракуем только явный перекос — иначе
+    # 'Инди' -> 'Электроника' отбивалось бы ложно и весь LLM-путь встал бы в
+    # мусорный генератор.
+    lo, hi = max(2, len(o) // 2), len(o) * 2 + 8
+    if not (lo <= len(r) <= hi):
+        return f"длина свободного текста {len(o)} -> {len(r)}"
+    return _case_violation(o, r)
+
+
+def _format_hint(field: str) -> str:
+    """Обратная связь модели: на этом же поле уже ломали формат."""
+    n = _FORMAT_VIOLATIONS.get(field, 0)
+    if not n:
+        return ""
+    return (f"NOTE: on the previous chunk of this same field, {n} of your "
+            f"replacements were rejected for breaking the original format. "
+            f"Re-read rules 1-6: match length, alphabet and separators exactly.")
+
+
 class LLMClient:
     """Call an OpenAI-compatible LLM /chat/completions API for batch data generation.
 
@@ -36,11 +204,23 @@ class LLMClient:
         # Chunking parameters for large payloads
         self.chunk_max_chars = 2500       # Approx chars per sub-request
         # ЖЁСТКИЙ лимит на число значений в одном запросе. Узкое место — не размер
-        # промпта, а длительность генерации: гейтвей ofox обрывает коннект на ~60s
-        # (замерено: 20 значений ≈ 26s успешно, 40+ ≈ curl rc=52 empty reply).
-        # Поэтому чанки маленькие, плюс авто-деление пополам при пустом ответе.
+        # промпта, а длительность генерации. Замеры на реальном пути (ofox, чанк из
+        # реального дампа, max_tokens=32768):
+        #   qwen3.8-flash  20 значений → 13.3s и 20.5s, обе попытки полные (20/20)
+        #   qwen3.5-flash  20 значений → 54.2s; 40 значений → 179.1s лишь благодаря
+        #                  авто-делению (сам запрос не возвращается: ofox обрывает
+        #                  коннект на ~60s, curl rc=52)
+        #   40 значений на 3.8-flash → 158.7s, тоже только через деление
+        # Отсюда 20 — не «на глаз», а половина того, что 3.5-flash успевает за стену.
+        # Пустой ответ лечится по-разному в зависимости от ПРИРОДЫ (см. _classify_empty),
+        # и дробление помогает лишь в одном из двух случаев.
         self.max_values_per_chunk = 20
         self.max_split_depth = 3          # 20 -> 10 -> 5 -> 2
+        # Потолок бюджета генерации при разовом расширении (см. EMPTY_BUDGET).
+        # Выше 64k модель уже не «думает», а конфигурация большинства шлюзов
+        # отказывает. Ставим с запасом: обрезка ответа стоит дороже лишней генерации.
+        self.max_tokens_ceiling = 65536
+        self._last_empty_kind: Optional[str] = None
         # Бюджет времени считается АДАПТИВНО под каждый запрос (_chunk_timeout):
         # reasoning-модели тратят скрытые reasoning-токены из того же max_tokens,
         # поэтому чанк на ~100 значений может идти минуты, а не десятки секунд.
@@ -56,11 +236,38 @@ class LLMClient:
             if elapsed < 1.0:
                 time.sleep(1.0 - elapsed)
 
-    def _build_payload(self, prompt: str, system_prompt: str = "") -> dict:
+    EMPTY_GATEWAY = "gateway"   # обрыв коннекта / rc!=0 / нет choices → лечить дроблением
+    EMPTY_BUDGET = "budget"     # finish_reason=length → лечить бюджетом, не чанком
+
+    def _classify_empty(self, response_data: Dict[str, Any], content: str) -> None:
+        """Запомнить ПРИРОДУ пустого ответа: от неё зависит способ лечения.
+
+        Различение обязательно: раньше обе причины давали `{}`, и клиент начинал
+        делить чанк пополам. Дробление при исчерпанном бюджете генерации бессильно
+        (каждый осколок съедает те же скрытые токены reasoning) и лишь сжигает по
+        запросу на каждый уровень глубины: замер 20 значений при max_tokens=2048
+        дал 4 запроса, 150.7 с и 13/20 значений вместо одного точного повтора.
+        """
+        self._last_empty_kind = self.EMPTY_GATEWAY
+        if content:
+            return
+        choices = response_data.get("choices") or []
+        finish = (choices[0].get("finish_reason") or "").lower() if choices else ""
+        if finish == "length":
+            self._last_empty_kind = self.EMPTY_BUDGET
+            details = ((response_data.get("usage") or {})
+                       .get("completion_tokens_details") or {})
+            import sys
+            print(f"  [WARN] пустой ответ: finish_reason=length, "
+                  f"reasoning-токенов={details.get('reasoning_tokens')} — бюджет "
+                  f"max_tokens съеден reasoning'ом, размер чанка ни при чём", file=sys.stderr)
+
+    def _build_payload(self, prompt: str, system_prompt: str = "",
+                       max_tokens: Optional[int] = None) -> dict:
         """Build the JSON payload dict for a single API call."""
         payload = {
             "model": self.config.llm.model,
-            "max_tokens": self.config.llm.max_tokens,
+            "max_tokens": max_tokens or self.config.llm.max_tokens,
             "temperature": 0.3,
             "response_format": {"type": "json_object"},
         }
@@ -87,7 +294,8 @@ class LLMClient:
 
     def _call_chunk_with_split(self, chunk: List[str], build_prompt_fn: Callable,
                                index: int = 0, total: int = 1,
-                               depth: int = 0) -> Dict[str, str]:
+                               depth: int = 0,
+                               field: str = "") -> Dict[str, str]:
         """Один чанк с рекурсивным дроблением при пустом ответе.
 
         Пустой ответ на длинном запросе почти всегда означает не «модель не смогла»,
@@ -97,6 +305,14 @@ class LLMClient:
         символам от этого не защищала.
         """
         prompt, system_prompt = build_prompt_fn(chunk)
+        # Правила формата — в system каждой задачи. Часть билдеров (value_replacement,
+        # phone, postal, email) вообще не передавала system prompt, и требование
+        # формата до модели не доходило.
+        system_prompt = system_prompt or ""
+        system_prompt = FORMAT_RULES + (("\n\n" + system_prompt) if system_prompt else "")
+        hint = _format_hint(field)
+        if hint:
+            system_prompt += "\n\n" + hint
         timeout = self._chunk_timeout(len(chunk), len(prompt))
         label = f"chunk {index}/{total}" if not depth else f"{index}/{total}.d{depth}"
 
@@ -105,6 +321,21 @@ class LLMClient:
         except LLMTimeoutError as e:
             print(f"  [WARN] {label}: {e}")
             result = {}
+
+        # Пусто по причине бюджета — сначала ОДИН повтор того же чанка с расширенным
+        # max_tokens. Делить пополам будем только если и он не принёс результата.
+        if not result and self._last_empty_kind == self.EMPTY_BUDGET:
+            bigger = min(max(self.config.llm.max_tokens, 8192) * 2,
+                         self.max_tokens_ceiling)
+            if bigger > self.config.llm.max_tokens:
+                print(f"      ⤷ {label}: обрезано по limit — повторяю тот же чанк "
+                      f"({len(chunk)} знач.) с max_tokens={bigger}")
+                try:
+                    result = self._call_single(prompt, system_prompt,
+                                               timeout=timeout, max_tokens=bigger)
+                except LLMTimeoutError as e:
+                    print(f"  [WARN] {label}: {e}")
+                    result = {}
 
         if result or depth >= self.max_split_depth or len(chunk) <= 3:
             if depth == 0 and total > 1:
@@ -115,9 +346,9 @@ class LLMClient:
         print(f"      ⤷ {label}: пусто при {len(chunk)} значениях — делю пополам "
               f"(глубина {depth + 1})")
         left = self._call_chunk_with_split(chunk[:mid], build_prompt_fn, index, total,
-                                           depth + 1)
+                                           depth + 1, field=field)
         right = self._call_chunk_with_split(chunk[mid:], build_prompt_fn, index, total,
-                                            depth + 1)
+                                            depth + 1, field=field)
         merged = dict(left)
         merged.update(right)
         return merged
@@ -149,6 +380,7 @@ class LLMClient:
             return {}
         
         content = choices[0].get("message", {}).get("content") or ""
+        self._classify_empty(response_data, content)
         
         # Debug: log raw response for failed extractions
         if not content:
@@ -178,23 +410,31 @@ class LLMClient:
             response_data = json.loads(result.stdout)
             choices = response_data.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content") or ""
+                content = choices[0].get("message", {}).get("content") or ""
+                self._classify_empty(response_data, content)
+                return content
         except (json.JSONDecodeError, KeyError):
             pass
         return ""
 
     def _call_single(self, prompt: str, system_prompt: str = "",
-                     timeout: Optional[int] = None) -> Dict[str, Any]:
-        """Make ONE API call with rate limiting and retry logic."""
+                     timeout: Optional[int] = None,
+                     max_tokens: Optional[int] = None) -> Dict[str, Any]:
+        """Make ONE API call with rate limiting and retry logic.
+
+        max_tokens переопредляется только повтором с расширенным бюджетом
+        (см. _classify_empty / EMPTY_BUDGET).
+        """
         self._safe_rate_limit()
         self._call_count += 1
         self._last_call = time.time()
+        self._last_empty_kind = None
 
         # Явный timeout не задан — считаем по размеру промпта.
         if timeout is None:
             timeout = self._chunk_timeout(0, len(prompt))
 
-        payload = self._build_payload(prompt, system_prompt)
+        payload = self._build_payload(prompt, system_prompt, max_tokens=max_tokens)
         
         content = self._execute_curl(payload, timeout)
         
@@ -280,6 +520,7 @@ class LLMClient:
         build_prompt_fn: Callable[[List[str]], tuple],
         samples: List[str],
         stats: Optional[Dict] = None,
+        field_key: str = "",
     ) -> Dict[str, str]:
         """Chunk a large sample list into smaller API calls and merge results.
         
@@ -294,6 +535,12 @@ class LLMClient:
         # Один путь для всех случаев: режем на чанки и идём по ним. Раньше
         # колонки до 150 значений уходили ОДНИМ запросом — на гейтвее с обрезкой
         # коннекта на 60s это гарантированно означало потерянную колонку целиком.
+        # РАМКИ ОБЪЁМА ЗДЕСЬ НЕТ — это намеренно. Задача движка — один раз
+        # прогнать через API ВСЕ уникальные значения поля, слить их в
+        # global_mapping.json и потом на стриминге только читать маппинг. Любое
+        # усечение здесь означало бы, что часть значений вообще не поменяется
+        # (transform() оставляет оригинал, если значения нет ни в маппинге, ни в
+        # пуле) — то есть персональные данные остались бы в выходе. Долго — ок.
         chunks = self._split_by_budget(samples)
         if not chunks:
             return {}
@@ -304,7 +551,8 @@ class LLMClient:
         all_results = []
         for i, chunk in enumerate(chunks):
             all_results.append(
-                self._call_chunk_with_split(chunk, build_prompt_fn, i + 1, len(chunks))
+                self._call_chunk_with_split(chunk, build_prompt_fn, i + 1, len(chunks),
+                                            field=field_key)
             )
             
             # Brief pause between chunks to avoid rate limits
@@ -312,8 +560,33 @@ class LLMClient:
                 time.sleep(0.5)
         
         merged = self._merge_chunk_results(all_results)
-        print(f"  Chunked merge: {len(merged)} total entries from {len(chunks)} chunks")
-        return merged
+        kept, dropped = self._check_format(merged, field_key)
+        if dropped:
+            print(f"      ⚠️  по формату отбраковано {len(dropped)}/{len(merged)} — "
+                  f"значения уйдут в локальный генератор, который формат держит")
+            for orig, repl, why in dropped[:5]:
+                print(f"         • {orig[:24]!r} → {repl[:24]!r}: {why}")
+        print(f"  Chunked merge: {len(kept)} записей из {len(merged)} "
+              f"({len(chunks)} chunk(s))")
+        return kept
+
+    @staticmethod
+    def _check_format(mapping: Dict[str, str], field: str = "") -> tuple:
+        """Прогнать маппинг через правила формата: (оставшие, [(ориг, замена, почему)])."""
+        kept: Dict[str, str] = {}
+        dropped = []
+        for original, replacement in mapping.items():
+            if not isinstance(original, str) or not isinstance(replacement, str):
+                dropped.append((str(original)[:24], str(replacement)[:24], "не строка"))
+                continue
+            why = format_violation(original, replacement, field)
+            if why:
+                dropped.append((original, replacement, why))
+            else:
+                kept[original] = replacement
+        if dropped and field:
+            _FORMAT_VIOLATIONS[field] = _FORMAT_VIOLATIONS.get(field, 0) + len(dropped)
+        return kept, dropped
 
     @staticmethod
     def _extract_json(text: str) -> Dict[str, Any]:
@@ -413,7 +686,7 @@ Return a JSON object where keys are the original names and values are the new na
 Example: {{"John Smith": "James Anderson", "Jane Doe": "Sarah Williams"}}"""
             return prompt, system_prompt
         
-        return self._call_api_chunked(build_prompt, samples, stats)
+        return self._call_api_chunked(build_prompt, samples, stats, field_key=field_key)
 
     def generate_value_replacement(
         self,
@@ -437,7 +710,7 @@ Replace each value with a realistic alternative for this type of data.
 Return JSON: {{"original": "replacement", ...}}"""
             return prompt, ""
         
-        return self._call_api_chunked(build_prompt, samples)
+        return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
     def generate_phone_mapping(
         self,
@@ -455,7 +728,7 @@ Phones:
 {sample_str}"""
             return prompt, ""
         
-        return self._call_api_chunked(build_prompt, samples)
+        return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
     def generate_address_mapping(
         self,
@@ -475,7 +748,7 @@ Addresses:
 {sample_str}"""
             return prompt, ""
         
-        return self._call_api_chunked(build_prompt, samples, stats)
+        return self._call_api_chunked(build_prompt, samples, stats, field_key=field_key)
 
     def generate_email_mapping(
         self,
@@ -497,7 +770,7 @@ Return JSON: {{"original_email": "new_email", ...}}
 Emails: {sample_str}"""
             return prompt, ""
         
-        return self._call_api_chunked(build_prompt, samples)
+        return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
     def generate_title_mapping(
         self,
@@ -514,7 +787,7 @@ Return JSON: {{"original_title": "new_title", ...}}
 Titles: {sample_str}"""
             return prompt, ""
         
-        return self._call_api_chunked(build_prompt, samples)
+        return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
     def generate_company_mapping(
         self,
@@ -531,7 +804,7 @@ Return JSON: {{"original_company": "new_company", ...}}
 Companies: {sample_str}"""
             return prompt, ""
         
-        return self._call_api_chunked(build_prompt, samples)
+        return self._call_api_chunked(build_prompt, samples, field_key=field_key)
 
     def generate_postal_code_mapping(
         self,
@@ -549,4 +822,4 @@ Codes:
 {sample_str}"""
             return prompt, ""
         
-        return self._call_api_chunked(build_prompt, samples)
+        return self._call_api_chunked(build_prompt, samples, field_key=field_key)

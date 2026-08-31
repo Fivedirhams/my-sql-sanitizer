@@ -8,7 +8,8 @@
 #   3. Select dump → review config → run!
 #
 # Batch Mode (no wizard):
-#   docker compose run --rm cloakdb --batch /input/dump.sql -o /output/result.sql
+#   docker compose run --rm cloakdb --batch examples/chinook_test.sql \
+#                                  -o /app/output/sanitized.sql
 #
 # Development (hot-reload config):
 #   docker compose up                         # Rebuilds on first run
@@ -29,7 +30,10 @@ services:
       - ./config.yaml:/app/config.yaml:ro       # Config (read-only)
       - ./output:/app/output                    # Output directory
       - ./examples:/app/examples:ro             # Example dumps
-      - ./my_dump.sql:/input/dump.sql:ro        # Your custom dump (optional, replace name)
+      # Свой дамп: положить файл в examples/ и запустить с --batch examples/<файл>.
+      # Отдельный монтир `/input/dump.sql` был удалён: файла в репозитории нет, а
+      # docker при отсутствующем источнике молча создаёт КАТАЛОГ на его месте —
+      # и --batch получает папку вместо дампа.
 
     environment:
       # LLM — настраивается ЦЕЛИКОМ через .env: provider / model / endpoint / token.

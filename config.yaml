@@ -1,137 +1,101 @@
 # =============================================================================
 # CloakDB Configuration — SQL Dump Sanitizer
 # =============================================================================
-# Rules override auto-detected types for specific columns.
-# Format: Table.Column or just ColumnName → transformer_type
+# Auto-generated from chinook_test.sql
+#
+# Format: Table.Column → transformer_type
 # Available types: name, email, phone, address, title, company, genre,
-#                 crm_status, date_shuffle_year, date_shuffle_month, composer, postal_code
-# Special: "skip" — column passes through unchanged (PK/FK, tax IDs, metrics)
+#                  date_shuffle_year, date_shuffle_month, composer, postal_code
+# Special: skip — column passes through unchanged (PK/FK, metrics)
 # =============================================================================
 
 transforms:
-  # ── Chinook / Music Store ──────────────────────────────────────────
-  Artist.Name: name                  # LLM realistic names
-  Genre.Name: genre                  # Cyclic swap (Rock → Jazz → Blues…)
-  MediaType.Name: genre              # Same cycling logic
+  # ── Album ──
+  Album.AlbumId: skip
+  Album.ArtistId: skip
+  Album.Title: title
 
-  Customer.FirstName: name           # Realistic first names
-  Customer.LastName: name            # Realistic last names
-  Customer.Company: company          # Employer/company names
-  Customer.Address: address          # Street addresses
-  Customer.City: genre               # Cities use deterministic rotation
-  Customer.State: genre              # State/province codes
-  Customer.Country: genre            # Country names
-  Customer.PostalCode: postal_code   # ZIP/Postcode format-preserving
-  Customer.Phone: phone              # Phone with format preservation
-  Customer.Fax: phone                # Treated as phone
-  Customer.Email: email              # Domain-preserved emails
+  # ── Artist ──
+  Artist.ArtistId: skip
+  Artist.Name: name
 
-  Employee.FirstName: name           # Staff names
+  # ── Customer ──
+  Customer.Address: address
+  Customer.City: genre
+  Customer.Company: company
+  Customer.Country: genre
+  Customer.CustomerId: skip
+  Customer.Email: email
+  Customer.Fax: phone
+  Customer.FirstName: name
+  Customer.LastName: name
+  Customer.Phone: phone
+  Customer.PostalCode: postal_code
+  Customer.State: genre
+  Customer.SupportRepId: skip
+
+  # ── Employee ──
+  Employee.Address: address
+  Employee.BirthDate: date_shuffle_year
+  Employee.City: genre
+  Employee.Country: genre
+  Employee.Email: email
+  Employee.EmployeeId: skip
+  Employee.Fax: phone
+  Employee.FirstName: name
+  Employee.HireDate: date_shuffle_year
   Employee.LastName: name
-  Employee.Title: title              # Job titles
-  Employee.Address: address          # Addresses
-  Employee.City: genre               # Cities
-  Employee.State: genre              # States
-  Employee.Country: genre            # Countries
-  Employee.PostalCode: postal_code   # Postcodes
-  Employee.Phone: phone              # Phones
-  Employee.Fax: phone                # Fax phones
-  Employee.Email: email              # Emails
-  Employee.BirthDate: date_shuffle_year  # Shuffle dates by year
-  Employee.HireDate: date_shuffle_year   # Shuffle dates by year
+  Employee.Phone: phone
+  Employee.PostalCode: postal_code
+  Employee.ReportsTo: skip
+  Employee.State: genre
+  Employee.Title: title
 
-  Invoice.BillingAddress: address    # Billing addresses
-  Invoice.BillingCity: genre         # Cities
-  Invoice.BillingState: genre        # States
-  Invoice.BillingCountry: genre      # Countries
-  Invoice.BillingPostalCode: postal_code  # Postcodes
-  Invoice.InvoiceDate: date_shuffle_year   # Shuffle invoice dates
-  Invoice.Total: skip                # Numeric metric
+  # ── Genre ──
+  Genre.GenreId: skip
+  Genre.Name: genre
 
-  InvoiceLine.Quantity: skip         # Integer count
-  InvoiceLine.UnitPrice: skip        # Decimal amount
+  # ── Invoice ──
+  Invoice.BillingAddress: address
+  Invoice.BillingCity: genre
+  Invoice.BillingCountry: genre
+  Invoice.BillingPostalCode: postal_code
+  Invoice.BillingState: genre
+  Invoice.CustomerId: skip
+  Invoice.InvoiceDate: date_shuffle_year
+  Invoice.InvoiceId: skip
+  Invoice.Total: skip
 
-  Track.Name: name                   # Song titles
-  Track.Composer: composer           # Composer names
-  Playlist.Name: name                # Playlist names
+  # ── InvoiceLine ──
+  InvoiceLine.InvoiceId: skip
+  InvoiceLine.InvoiceLineId: skip
+  InvoiceLine.Quantity: skip
+  InvoiceLine.TrackId: skip
+  InvoiceLine.UnitPrice: skip
 
-  # ── Business CRM Sample ────────────────────────────────────────────
-  companies.Inn: skip                # Tax ID — checksum validation required
-  companies.Kpp: skip                # Tax registration code
-  companies.Ogrn: skip               # Primary state registration number
-  companies.CompanyName: company     # Organization names
-  companies.LegalAddress: address    # Registered addresses
-  companies.City: genre              # Cities
-  companies.Phone: phone             # Corporate phones
-  companies.Email: email             # Corporate emails
-  companies.Industry: genre          # Industry categories
-  companies.Status: crm_status       # active/inactive/bankrupt…
+  # ── MediaType ──
+  MediaType.MediaTypeId: skip
+  MediaType.Name: genre
 
-  contacts.FirstName: name           # Personal names
-  contacts.LastName: name
-  contacts.MiddleName: name          # Patronymics (Russian context)
-  contacts.JobTitle: title           # Positions/roles
-  contacts.PersonalEmail: email      # Work/personal emails
-  contacts.DirectPhone: phone        # Direct lines
-  contacts.PreferredCity: genre      # Location
-  contacts.LeadSource: genre         # web/referral/expo/cold_call/partner
-  contacts.Status: crm_status        # new/qualified/negotiation/won/lost/on_hold
+  # ── Playlist ──
+  Playlist.Name: name
+  Playlist.PlaylistId: skip
 
-  deals.ContractNumber: genre        # Contract IDs
-  deals.Terms: crm_status            # prepaid/net30/net60/escrow
-  deals.Stage: crm_status            # prospecting/proposal/negotiation/closed_won
-  deals.Description: address         # Free text → generic replacement
+  # ── PlaylistTrack ──
+  PlaylistTrack.PlaylistId: skip
+  PlaylistTrack.TrackId: skip
 
-  payments.InvoiceNumber: genre      # Invoice IDs
-  payments.PayAmount: crm_status     # Numeric amounts
-  payments.Method: crm_status        # bank_transfer/crypto/card/cash
-  payments.Status: crm_status        # pending/paid/overdue/cancelled
-  
-  # ── Business CRM Sample ────────────────────────────────────────────
-  companies.Inn: skip                # TAX ID - checksum validation required!
-  companies.Kpp: skip                # Tax registration code
-  companies.Ogrn: skip               # Primary state registration number
-  companies.CompanyName: company     # Organization names
-  companies.LegalAddress: address    # Registered addresses
-  companies.City: crm_status         # Cities
-  companies.Phone: phone             # Corporate phones
-  companies.Email: email             # Corporate emails
-  companies.Industry: genre          # Industry categories
-  companies.Status: crm_status       # active/inactive/bankrupt...
-  
-  contacts.FirstName: name           # Personal names
-  contacts.LastName: name
-  contacts.MiddleName: name          # Patronymics (Russian context)
-  contacts.JobTitle: title           # Positions/roles
-  contacts.PersonalEmail: email      # Work/personal emails
-  contacts.DirectPhone: phone        # Direct lines
-  contacts.PreferredCity: crm_status # Location
-  contacts.LeadSource: crm_status    # web/referral/expo/cold_call/partner
-  contacts.Status: crm_status        # new/qualified/negotiation/won/lost/on_hold
-  
-  deals.ContractNumber: crm_status   # Contract IDs
-  deals.Terms: crm_status            # prepaid/net30/net60/escrow
-  deals.Stage: crm_status            # prospecting/proposal/negotiation/closed_won
-  deals.Description: address         # Free text → generic replacement
-  
-  payments.InvoiceNumber: crm_status # Invoice IDs
-  payments.PayAmount: crm_status     # Numeric amounts
-  payments.Method: crm_status        # bank_transfer/crypto/card/cash
-  payments.Status: crm_status        # pending/paid/overdue/cancelled
+  # ── Track ──
+  Track.AlbumId: skip
+  Track.Bytes: skip
+  Track.Composer: composer
+  Track.GenreId: skip
+  Track.MediaTypeId: skip
+  Track.Milliseconds: skip
+  Track.Name: genre  # Быстрая локальная ротация
+  Track.TrackId: skip
+  Track.UnitPrice: skip
 
-
-# =============================================================================
-# Processing / Output Settings  (СПРАВОЧНО — см. ниже)
-# =============================================================================
-# Парсер config.yaml читает ТОЛЬКО секцию `transforms:` выше. Всё, что ниже,
-# игнорируется. Реальные параметры обработки задаются через .env:
-#   SAMPLES_PER_FIELD   глубина профилирования на поле  (default 50)
-#   PROFILES_DIR        куда писать JSON-профили         (default output/profiles)
-# Размер LLM-чанка (~150 значений / 2500 симв.), таймауты и формат вывода
-# зашиты в коде и через YAML НЕ настраиваются.
-#
-# Ключи processing:/output: оставлены как терминаторы блока transforms —
-# не удаляйте их совсем, иначе парсер примет последующие строки за правила.
 processing: {}
 
 output: {}

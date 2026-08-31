@@ -33,7 +33,7 @@ if [[ $# -eq 0 ]]; then
 else
     # === БЫСТРЫЙ РЕЖИМ (для CI/CD и повторных прогонов) ===
     INPUT_DUMP="$1"
-    OUTPUT_FILE="${2:-output/sanitized.sql}"
+    shift
 
     if [[ ! -f "$INPUT_DUMP" ]]; then
         echo "❌ Input dump not found: $INPUT_DUMP"
@@ -41,12 +41,22 @@ else
         exit 1
     fi
 
+    # Хвост аргументов уходит в cloaker как есть. Раньше второй аргумент подставлялся
+    # в `-o` буквально, и документированный запуск `./start.sh dump.sql -o out.sql`
+    # превращался в `-o "-o"` — имя выходного файла терялось, а `out.sql` уезжал
+    # неизвестным аргументом. Одинокий путь без флага по-прежнему значит `-o`.
+    if [[ $# -eq 1 && "$1" != -* ]]; then
+        set -- -o "$1"
+    elif [[ $# -eq 0 ]]; then
+        set -- -o output/sanitized.sql
+    fi
+
     echo "============================================================"
     echo "CloakDB — Quick Mode (skip wizard)"
     echo "============================================================"
     echo ""
     echo "Input:   $INPUT_DUMP"
-    echo "Output:  $OUTPUT_FILE"
+    echo "Output:  ${2:-output/sanitized.sql}"
     echo ""
-    exec python3 -m cloaker --batch "$INPUT_DUMP" -o "$OUTPUT_FILE"
+    exec python3 -m cloaker --batch "$INPUT_DUMP" "$@"
 fi

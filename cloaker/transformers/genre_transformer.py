@@ -28,10 +28,11 @@ class GenreTransformer(BaseTransformer):
         if value in self._mapping:
             return self._mapping[value]
         
-        # Check global cache (value swapped from another table/column)
-        from cloaker.cache import GlobalMappingRegistry
+        # Проверка своей области: значения из словаря ДРУГОЙ колонки сюда не
+        # приходят (раньше — приходили, и жанровый сдвиг подменял город/статус).
+        from cloaker.cache import GlobalMappingRegistry, field_scope
         reg = GlobalMappingRegistry.instance()
-        cached = reg.get_replacement(value)
+        cached = reg.get_replacement(value, scope=field_scope(field_key))
         if cached:
             return cached
         
@@ -55,8 +56,11 @@ class GenreTransformer(BaseTransformer):
         field_key: str,
         stats: Dict[str, Any],
     ) -> None:
-        from cloaker.cache import GlobalMappingRegistry
+        from cloaker.cache import GlobalMappingRegistry, field_scope
         reg = GlobalMappingRegistry.instance()
+        # Область = имя колонки из field_key (то же расщепление, что в transform()),
+        # чтобы запись в Phase 2 и чтение в Phase 3 попадали в одну корзину.
+        scope = field_scope(field_key)
         
         unique_values = list(dict.fromkeys(s["value"] for s in samples if s.get("value")))
         
@@ -67,15 +71,17 @@ class GenreTransformer(BaseTransformer):
         reg.register_shuffle_pool(field_key, unique_values)
         
         # Filter out already-mapped values
-        unseen = [v for v in unique_values if not reg.get_replacement(v)]
+        unseen = [v for v in unique_values if not reg.get_replacement(v, scope=scope)]
         
         # Create cyclic permutation for unseen values
         for i, val in enumerate(unseen):
             next_val = unseen[(i + 1) % len(unseen)]
             self._mapping[val] = next_val
-            reg.set_mapping(val, next_val)
+            reg.set_mapping(val, next_val, scope=scope)
         
-        # Add globally mapped values
+        # Add values already mapped in this column's domain
         for v in unique_values:
-            if v not in self._mapping and reg.get_replacement(v):
-                self._mapping[v] = reg.get_replacement(v)
+            if v not in self._mapping:
+                mapped = reg.get_replacement(v, scope=scope)
+                if mapped:
+                    self._mapping[v] = mapped

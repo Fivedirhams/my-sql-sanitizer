@@ -1,26 +1,147 @@
-"""Postal code transformer — deterministic format-preserving replacement, ZERO LLM calls.
+"""Postal code transformer — детерминированная подмена с полным сохранением формата.
 
-Strategy: hash-derived substitution of digits and letters, preserving separators.
-Format (dashes, spaces, parentheses) is kept exactly intact.
-Each unique input always produces the same output (idempotent).
-No file/directory dependencies — fully stateless computation.
-Cross-table consistency via GlobalMappingRegistry.
+Стратегия: подмена цифр и буквенных прогонов по затравке из sha256 ЗНАЧЕНИЯ.
+Формат сохраняется строго: длина, порядок разрядов, ведущие нули, все
+разделители (пробел, дефис, точка) и алфавит каждого символа.
+Алфавит выбирается по классу ИСХОДНОГО символа: ASCII-буква остаётся
+латиницей того же регистра, кириллическая буква остаётся кириллицей того
+же регистра (Никакой «латыни» из кириллицы — N9 из `output/format_audit.md`).
 
-Supported formats:
+Один и тот же вход всегда даёт один и тот же выход: функция детерминирована
+по значению и не зависит от PYTHONHASHSEED, поэтому прогоны воспроизводимы.
+
+Поддерживаемые форматы:
   - US ZIP:        98004, 98004-1234
-  - Russian:       123456, 123-456
+  - Russian:       123456, 123-456, 012345 (ведущий ноль сохранён)
   - UK:            SW1A 1AA, EC1A 1BB
   - Canadian:      K1A 0B1
-  - Any mixed:     (xxx) xxx-xxxx where x=digit or letter
+  - RU с текстом:  МУР 1234, Киров 610000 (кириллица → кириллица)
 """
 
 from __future__ import annotations
 
 import hashlib
-import re
-from typing import Dict, List, Any, Optional
+import random
+from typing import Any, Dict, List, Optional, Tuple
 
 from cloaker.base_transformer import BaseTransformer
+
+
+# ── Алфавиты и пулы для подмены ──────────────────────────────────────
+# Хелперы сознательно дублируются в email/address-трансформерах: общий модуль
+# потребовал бы правки base_transformer.py (вне зоны этой задачи).
+
+# Латиница (ASCII) — 26 букв в алфавитном порядке
+_LATIN = "abcdefghijklmnopqrstuvwxyz"
+# Русская азбука целиком, включая Ё: 33 строчные буквы
+_CYRILLIC = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+
+_DIGITS = "0123456789"
+
+# Согласные/гласные: буквенный прогон заменяется «псевдословом» с их
+# чередованием, чтобы подмена читалась значением, а не шумом («ЦЩК»).
+_CONSONANTS_RU = "бвгдзжклмнпрстфхцчшщ"
+_VOWELS_RU = "аеиоуыэюя"
+_CONSONANTS_EN = "bcdfghjklmnprstvwxz"
+_VOWELS_EN = "aeiou"
+
+
+def _is_ascii_letter(ch: str) -> bool:
+    """Латинская ли это буква (по классу ИСХОДНОГО символа)."""
+    return ch.isascii() and ch.isalpha()
+
+
+def _is_cyrillic_letter(ch: str) -> bool:
+    """Кириллическая ли это буква (не-ASCII буква)."""
+    return ch.isalpha() and not ch.isascii()
+
+
+def _letter_kind(ch: str) -> Optional[str]:
+    """Алфавит буквы: ``'ru'`` | ``'en'`` | ``None`` (не буква)."""
+    if not ch.isalpha():
+        return None
+    return "en" if ch.isascii() else "ru"
+
+
+def _letter_runs(text: str) -> List[Tuple[int, int, str]]:
+    """Максимальные прогоны букв одного алфавита: [(start, end, kind)]."""
+    runs: List[Tuple[int, int, str]] = []
+    i, n = 0, len(text)
+    while i < n:
+        kind = _letter_kind(text[i])
+        if kind is None:
+            i += 1
+            continue
+        j = i
+        while j < n and _letter_kind(text[j]) == kind:
+            j += 1
+        runs.append((i, j, kind))
+        i = j
+    return runs
+
+
+def _different_digit(ch: str, rng: random.Random) -> str:
+    """Цифра, гарантированно не равная исходной (класс «цифра» сохранён)."""
+    if not (ch.isdigit() and ch.isascii()):
+        # не-ASCII цифры (арабо-индийские и т. п.) не «угадываем» — оставляем
+        return ch
+    for _attempt in range(10):
+        candidate = rng.choice(_DIGITS)
+        if candidate != ch:
+            return candidate
+    return str((int(ch) + 1) % 10)
+
+
+def _different_letter(ch: str, rng: random.Random) -> str:
+    """Буква того же алфавита и регистра, не равная исходной (запасной ход)."""
+    if _is_ascii_letter(ch):
+        alphabet = _LATIN
+    elif _is_cyrillic_letter(ch):
+        alphabet = _CYRILLIC
+    else:
+        return ch
+    lowered = ch.lower()
+    if lowered not in alphabet:
+        return ch
+    for _attempt in range(20):
+        candidate = rng.choice(alphabet)
+        if candidate != lowered:
+            return candidate.upper() if ch.isupper() else candidate
+    idx = alphabet.index(lowered)
+    return alphabet[(idx + 1) % len(alphabet)].upper() if ch.isupper() \
+        else alphabet[(idx + 1) % len(alphabet)]
+
+
+def _syllables(text: str, kind: str) -> List[str]:
+    """Рисунок «гласная/согласная» по позициям исходного написания."""
+    vowels = _VOWELS_RU if kind == "ru" else _VOWELS_EN
+    return ["v" if ch.lower() in vowels else "c" for ch in text]
+
+
+def _pseudo_word(text: str, kind: str, rng: random.Random) -> str:
+    """Псевдослово той же длины, алфавита, регистра и слогового рисунка.
+
+    Применяется, когда в пуле нет названия той же маски. Чередование
+    согласная/гласная берётся ИЗ исходного слова: «Москва» даёт «Тарлут»,
+    а не «Ляцщэя» — формат соблюдён в обоих случаях, но шум выглядит
+    опечаткой (претензия N9 к читаемости подмены).
+    """
+    cons, vows = (_CONSONANTS_RU, _VOWELS_RU) if kind == "ru" else (_CONSONANTS_EN, _VOWELS_EN)
+    pattern = _syllables(text, kind)
+    if pattern and "v" not in pattern:
+        # Сплошь согласные («РД», «Цщк») читаются только с гласной внутри
+        pattern = list(pattern)
+        pattern[min(1, len(pattern) - 1)] = "v"
+    for _attempt in range(20):
+        chars = []
+        for ch, slot in zip(text, pattern):
+            base = rng.choice(cons if slot == "c" else vows)
+            chars.append(base.upper() if ch.isupper() else base.lower())
+        candidate = "".join(chars)
+        if candidate != text:
+            return candidate
+    # Вероятность пренебрежимо мала, но схлопывание в оригинал недопустимо
+    return "".join(_different_letter(ch, rng) for ch in text)
 
 
 class PostalCodeTransformer(BaseTransformer):
@@ -37,27 +158,28 @@ class PostalCodeTransformer(BaseTransformer):
     # ── Core transform ────────────────────────────────────────────────
 
     def transform(self, value: Optional[str], table: str, column: str) -> Optional[str]:
-        if value is None:
+        if value is None or not isinstance(value, str):
             return value
 
         field_key = f"{table}_{column}"
-        
-        # Check local cache first (populated by _load_mapping or previous transforms)
+
+        # Проверка локального кэша (заполняется _load_mapping или прошлыми вызовами)
         if field_key in self._field_cache and value in self._field_cache[field_key]:
             return self._field_cache[field_key][value]
 
-        # Compute deterministic replacement
         result = self._deterministic(value)
-        
-        # Store in local cache
+
+        # Кэшируем результат, в том числе честный passthrough
         if field_key not in self._field_cache:
             self._field_cache[field_key] = {}
         self._field_cache[field_key][value] = result
 
-        # Merge into global registry for cross-table consistency
-        from cloaker.cache import GlobalMappingRegistry
-        reg = GlobalMappingRegistry.instance()
-        reg.set_mapping(value, result)
+        # В глобальный реестр уходит ТОЛЬКО реальная подмена: пары X→X
+        # ('NULL', '', '   ', короткие значения) отравляют другие колонки (N6).
+        if result != value:
+            from cloaker.cache import GlobalMappingRegistry
+            reg = GlobalMappingRegistry.instance()
+            reg.set_mapping(value, result)
 
         return result
 
@@ -73,86 +195,93 @@ class PostalCodeTransformer(BaseTransformer):
         seen_values: set[str] = set()
 
         for s in samples:
-            val = (s.get("value") or "").strip()
-            if val and len(val) >= 3:  # Postal codes are at least 3 chars
+            # Ключ — исходное значение целиком (не strip): иначе подмена
+            # ищется по «обрезанному» ключу и формат теряется.
+            val = s.get("value")
+            if not isinstance(val, str):
+                continue
+            if len(val.strip()) >= 3:  # индексы короче 3 символов не анонимизируем
                 seen_values.add(val)
 
-        # Pre-compute ALL mappings deterministically
         if field_key not in self._field_cache:
             self._field_cache[field_key] = {}
 
+        # Предвычисление — тем же детерминированным кодом, что и transform
         for val in seen_values:
             self._field_cache[field_key][val] = self._deterministic(val)
 
-        # Push to global registry for cross-table consistency
+        # В реестр — только фактические подмены (см. комментарий в transform)
         from cloaker.cache import GlobalMappingRegistry
         reg = GlobalMappingRegistry.instance()
-        reg.merge_mappings(self._field_cache[field_key])
+        reg.merge_mappings(
+            {k: v for k, v in self._field_cache[field_key].items() if k != v}
+        )
 
     # ── Deterministic generation ──────────────────────────────────────
 
     @staticmethod
-    def _replace_char(ch: str, seed_byte: int, idx: int) -> str:
-        """Replace a single alphanumeric character with a new one, preserving case/pattern.
-        
-        Digits → different digit (guaranteed != original)
-        Letters → different letter in same case (guaranteed != original)
-        Non-alphanumeric → returned unchanged (handled externally)
-        """
-        if ch.isdigit():
-            # Generate new digit guaranteed different from original
-            orig_d = int(ch)
-            for attempt in range(5):
-                mix = seed_byte ^ ((orig_d << 2) | (idx * 7))
-                candidate = (mix + orig_d * 3 + attempt * 11) % 10
-                if candidate != orig_d:
-                    return str(candidate)
-            return str((orig_d + 3) % 10)  # Fallback
-        
-        elif ch.isalpha():
-            # Preserve case: uppercase stays uppercase, lowercase stays lowercase
-            base = ord('A') if ch.isupper() else ord('a')
-            orig_idx = ord(ch.lower()) - ord('a')
-            
-            for attempt in range(5):
-                mix = seed_byte ^ ((orig_idx << 2) | (idx * 13))
-                candidate = (mix + orig_idx * 5 + attempt * 17) % 26
-                if candidate != orig_idx:
-                    return chr(base + candidate)
-            # Fallback: next letter wrapped
-            return chr(base + (orig_idx + 3) % 26)
-        
-        return ch
-
-    @staticmethod
     def _deterministic(code: str) -> str:
-        """Replace all alphanumeric characters with hash-derived ones.
-        Separators (space, dash, parens) preserved exactly.
-        Length identical to input.
+        """Подмена букв/цифр с посимвольным сохранением длины и маски.
+
+        Гарантии:
+          - ``len(result) == len(code)`` (пробелы по краям НЕ съедаются);
+          - цифра → цифра, ASCII-буква → латинская буква, кириллическая буква
+            → кириллическая, регистр совпадает по каждой позиции;
+          - разделители (пробел, дефис, точка) остаются на своих местах;
+          - ведущие нули сохраняются ('012345' → '0' + 5 цифр);
+          - '', '   ', 'NULL' (любой регистр) возвращаются как есть.
         """
-        raw = code.strip()
-        if not raw:
-            return raw
+        if not isinstance(code, str):
+            return code
 
-        # Validate it looks like a postal code (at least 3 alnum chars)
-        alnum_count = sum(1 for c in raw if c.isalnum())
-        if alnum_count < 3:
-            return raw
+        core = code.strip()
 
-        chars = list(raw)
-        seed_bytes = hashlib.sha256(raw.encode()).digest()
-        
-        # Collect positions of all alphanumeric characters
-        alnum_positions = [i for i, c in enumerate(chars) if c.isalnum()]
-        
-        # Replace each alphanumeric char with hash-derived alternative
-        result = list(chars)
-        for pos_offset, orig_pos in enumerate(alnum_positions):
-            byte_idx = (pos_offset * 3) % len(seed_bytes)
-            result[orig_pos] = PostalCodeTransformer._replace_char(
-                chars[orig_pos], 
-                seed_bytes[byte_idx], 
-                pos_offset
-            )
+        # Честные passthrough: пустая строка, строка из пробелов, SQL-токены.
+        # Раньше '   ' превращалось в '', а 'NULL' — в 'MLUM'.
+        if not core or core.upper() == "NULL":
+            return code
 
-        return ''.join(result)
+        # Похоже на почтовый индекс, только если есть что менять (>= 3 букв/цифр)
+        alnum_positions = [i for i, c in enumerate(code) if c.isalnum()]
+        if len(alnum_positions) < 3:
+            return code
+
+        # Затравка — функция от значения: один вход → один выход в любом
+        # процессе, независимо от PYTHONHASHSEED (встроенный hash() не используется).
+        seed = int.from_bytes(hashlib.sha256(code.encode("utf-8")).digest()[:8], "big")
+        rng = random.Random(seed)
+
+        # Ведущие нули — часть формата ('012345'): оставляем их нулями.
+        # Но защищаем не весь нулевой прогон, если из-за этого подмены бы не
+        # осталось: '0000' → '000' + одна сменённая цифра, а не '0000' целиком.
+        core_start = len(code) - len(code.lstrip())
+        leading_zero_len = len(core) - len(core.lstrip("0"))
+        protected = (
+            min(leading_zero_len, len(alnum_positions) - 1)
+            if leading_zero_len
+            else 0
+        )
+        keep_positions = {core_start + i for i in range(protected)}
+
+        result = list(code)
+
+        # 1) цифры — по одной позиции, гарантированно другие
+        for pos in alnum_positions:
+            if pos in keep_positions or not code[pos].isdigit():
+                continue
+            result[pos] = _different_digit(code[pos], rng)
+
+        # 2) буквы — прогон за прогоном, внутри своего алфавита и регистра
+        for start, end, kind in _letter_runs(code):
+            result[start:end] = _pseudo_word(code[start:end], kind, rng)
+
+        out = "".join(result)
+        if out == code:
+            # Страховка от схлопывания в оригинал (теоретически для чисто
+            # числовых значений): сдвигаем последнюю не-защищённую цифру.
+            for pos in reversed(alnum_positions):
+                if pos not in keep_positions and code[pos].isdigit():
+                    result[pos] = str((int(code[pos]) + 1) % 10)
+                    break
+            out = "".join(result)
+        return out

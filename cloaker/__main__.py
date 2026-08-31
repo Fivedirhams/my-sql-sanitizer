@@ -301,8 +301,8 @@ def run_batch_mode(input_path: str, output_path: Optional[str], config_path: str
 # ── Helpers ─────────────────────────────────────────────────────
 def print_header() -> None:
     console.print(Panel(
-        Text("CloakDB v2.0 — Анонимизатор SQL дампов", style="bold cyan"),
-        subtitle="Интерактивный мастер · Ломая данные через LLM (Kodik Router) · O(1) потоковая обработка",
+        Text("MySQL Sanitizer", style="bold cyan"),
+        subtitle="Интерактивный мастер",
         border_style="blue",
         padding=(0, 1)
     ))

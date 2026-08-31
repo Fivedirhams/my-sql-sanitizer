@@ -285,10 +285,10 @@ Return a JSON object where keys are the original names and values are the new na
 Example: {"John Smith": "James Anderson", "Jane Doe": "Sarah Williams"}
 
 Parameters:
-- max_tokens: 4096
+- max_tokens: 32768 (env: LLM_MAX_COMPLETION_TOKENS)
 - temperature: 0.3
 - response_format: {"type": "json_object"}
-- chunk_size: максимум 15 имён на вызов
+- chunk_size: до 150 значений на вызов (внутренний лимит)
 ```
 
 ### `CompanyTransformer` (company)
@@ -374,18 +374,12 @@ transforms:
   contacts.Status: crm_status         # Статусы контактов → цикл
   deals.Stage: crm_status             # Этапы сделок → цикл
 
-# === Параметры обработки ===
-processing:
-  batch_size: 20                      # Значений на один LLM-чанк
-  chunk_max_chars: 8000               # Макс. размер промпта (байт)
-  timeout_base: 30                    # Базовый таймаут LLM-запроса (сек)
-  timeout_max: 55                     # Максимальный таймаут (сек)
-
-# === Вывод ===
-output:
-  storage: file
-  overwrite: true
-  preserve_formatting: true
+# Параметры обработки (глубина выборки, пути вывода) задаются в .env:
+#   SAMPLES_PER_FIELD=50, PROFILES_DIR=output/profiles
+# Размер LLM-чанка (~150 значений) и таймауты зашиты в коде.
+# Парсер config.yaml читает ТОЛЬКО секцию transforms: — ниже справочно.
+processing: {}
+output: {}
 ```
 
 > **Важно:** `skip` означает «не трогать вообще». PK/FK (`*_id`, `Id`) пропускаются автоматически.
@@ -399,13 +393,14 @@ output:
 | `LLM_ENDPOINT` | пресет провайдера | URL Chat Completions API (пусто → пресет) |
 | `LLM_MODEL` | пресет провайдера | Модель генерации (пусто → пресет) |
 | `LLM_MAX_COMPLETION_TOKENS` | `32768` | Лимит токенов ответа LLM |
-| `BATCH_SIZE` | `20` | Значений на один LLM-чанк |
+| `SAMPLES_PER_FIELD` | `50` | Уникальных значений на поле при профилировании (Phase 1) |
+| `PROFILES_DIR` | `output/profiles` | Куда складывать JSON-профили полей |
 
 ### Почему чанкинг?
 
-API устанавливает `max_tokens: 4096` — это жёсткий лимит на ОБЪЁМ ОТВЕТА. Даже если модель поддерживает миллионный контекст, ответить JSON с 100 парами ключ-значение физически невозможно за 4096 токенов.
+Ответ LLM ограничен `max_tokens` (настраивается через `LLM_MAX_COMPLETION_TOKENS`, по умолчанию 32768) — это лимит на ОБЪЁМ ОТВЕТА. Модель не может вернуть бесконечный JSON за один вызов.
 
-**Стратегия чанкинга:** делим 100 значений на 7 чанков по 15 значений → 7 запросов к API → результат слепляется в единый словарь.
+**Стратегия чанкинга:** значения режутся на чанки до ~150 шт. (и в пределах лимита по символам) → несколько запросов к API → результаты склеиваются в единый словарь.
 
 ---
 
@@ -600,7 +595,7 @@ LLM_API_KEY=sk-your-key-here
 LLM_ENDPOINT=
 LLM_MODEL=
 LLM_MAX_COMPLETION_TOKENS=32768
-BATCH_SIZE=20
+SAMPLES_PER_FIELD=50
 ```
 
 ### Шаг 2: Сборка образа

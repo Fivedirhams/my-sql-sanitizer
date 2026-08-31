@@ -121,22 +121,17 @@ transforms:
 
 
 # =============================================================================
-# Processing Settings
+# Processing / Output Settings  (СПРАВОЧНО — см. ниже)
 # =============================================================================
-processing:
-  sample_limit: 50                   # Максимум уникальных значений на колонку для профилирования
-  batch_size: 15                     # Значений на один чанк LLM (≤15 для защиты от token overflow)
-  chunk_max_chars: 2500              # Prompt chunk size limit
-  timeout_base: 30                   # Base network timeout (seconds)
-  timeout_max: 55                    # Max timeout for large chunks
-  
-  profile_output_dir: output/profiles  # Where to save JSON profiles (optional)
+# Парсер config.yaml читает ТОЛЬКО секцию `transforms:` выше. Всё, что ниже,
+# игнорируется. Реальные параметры обработки задаются через .env:
+#   SAMPLES_PER_FIELD   глубина профилирования на поле  (default 50)
+#   PROFILES_DIR        куда писать JSON-профили         (default output/profiles)
+# Размер LLM-чанка (~150 значений / 2500 симв.), таймауты и формат вывода
+# зашиты в коде и через YAML НЕ настраиваются.
+#
+# Ключи processing:/output: оставлены как терминаторы блока transforms —
+# не удаляйте их совсем, иначе парсер примет последующие строки за правила.
+processing: {}
 
-
-# =============================================================================
-# Output Settings
-# =============================================================================
-output:
-  storage: file                      # Local file or stdout
-  overwrite: true                    
-  preserve_formatting: true          # Keep indentation/comments structure
+output: {}

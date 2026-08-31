@@ -35,8 +35,7 @@ class LLMConfig:
 
 @dataclass
 class ProcessingConfig:
-    batch_size: int = 20
-    sample_limit: int = 50
+    sample_limit: int = 50  # уникальных значений на колонку для профилирования (env: SAMPLES_PER_FIELD)
 
 
 @dataclass
@@ -60,8 +59,7 @@ class CloakDBConfig:
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     transform_rules: Dict[str, str] = field(default_factory=dict)  # {"Table.Column": "type"}
     db_profile: DatabaseProfile = field(default_factory=DatabaseProfile)
-    profiles_dir: str = "output/profiles"
-    transforms_output: str = "output/transforms"
+    profiles_dir: str = "output/profiles"  # env: PROFILES_DIR
 
 
 def _parse_yaml_simple(path: str) -> Dict[str, str]:
@@ -146,10 +144,9 @@ def load_config(config_path: str = "config.yaml") -> CloakDBConfig:
     cfg.llm.max_tokens = int(os.environ.get("LLM_MAX_COMPLETION_TOKENS", "32768"))
 
     # Process settings from env
-    cfg.processing.batch_size = int(os.environ.get("BATCH_SIZE", "20"))
+    # (размер LLM-чанка фиксирован внутри llm_client: ~150 значений / 2500 симв. — не env-ручка)
     cfg.processing.sample_limit = int(os.environ.get("SAMPLES_PER_FIELD", "50"))
     cfg.profiles_dir = os.environ.get("PROFILES_DIR", "output/profiles")
-    cfg.transforms_output = os.environ.get("TRANSFORMS_OUTPUT", "output/transforms")
 
     # Load transform rules from YAML (Table.Column: transformer_type)
     config_file = Path(config_path)

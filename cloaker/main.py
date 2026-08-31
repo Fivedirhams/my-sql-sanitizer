@@ -541,8 +541,12 @@ class SQLProcessor:
         Returns dict of {field_key: {type, samples count, note}}
         """
         selected_fields = {}
+        # Ограничение для автодетекта типов - используем только первые N значений
+        sample_limit = self.config.processing.sample_limit
         
         for field_key, items in samples.items():
+            # Для классификации типов используем только sample_limit значений
+            items_for_classify = items[:sample_limit]
             parts = field_key.split('_', 1)
             if len(parts) != 2:
                 selected_fields[field_key] = {
@@ -565,10 +569,11 @@ class SQLProcessor:
             
             # Check explicit config rule first
             explicit_rule = self._explicit_rule(table, column, field_key)
-            transformer_type = explicit_rule or self._auto_select_transformer(column, table, items)
+            # Для автодетекта используем ограниченный набор (sample_limit)
+            transformer_type = explicit_rule or self._auto_select_transformer(column, table, items_for_classify)
             
-            # Get sample stats
-            values = [i["value"] for i in items if i.get("value")]
+            # Get sample stats (для заметок используем те же ограниченные данные)
+            values = [i["value"] for i in items_for_classify if i.get("value")]
             has_at = any('@' in v for v in values)
             is_numeric = all(re.match(r'^[\d\+\-\(\)\.\s]+$', v) and len(re.sub(r'\D', '', v)) >= 7 for v in values[:5]) if values else False
             

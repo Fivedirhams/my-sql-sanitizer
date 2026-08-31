@@ -134,25 +134,14 @@ def format_violation(original: str, replacement: str, field: str = ""):
             return "не дата"
         return None
     
-    # Чисто цифры (индексы, коды): строго
+    # Чисто цифры (индексы): строго
     if o.isdigit():
         if not r.isdigit():
             return "число перестало быть числом"
         return None
     
-    # Маска-код (ABC-123,phone): проверяем длину и тип символов
-    if _is_code_like(o):
-        if len(o) != len(r):
-            return f"длина кода {len(o)} -> {len(r)}"
-        for a, b in zip(o, r):
-            if a.isdigit() != b.isdigit():
-                return "цифра стала буквой"
-            if a.isalpha() != b.isalpha():
-                return "буква стала цифрой"
-        return None
-    
-    # ВСЁ ОСТАЛЬНОЕ (свободный текст): только не пустое и не плейсхолдер
-    # LLM может менять длину, регистр, структуру - это НЕ проблема
+    # ВСЁ ОСТАЛЬНОЕ (включая названия групп, коды типа AC/DC, R.E.M.):
+    # LLM может менять ЛЮБУЮ часть - это НЕ проблема
     return None
 
 

@@ -18,12 +18,14 @@ vim .env
 python3 -m cloaker
 ```
 
-Мастер проходит через 4 этапа:
-1. **Выбор базы** — список доступных `.sql` файлов в `examples/`. В поставке одна демо-база (`chinook_test.sql`), она подставляется по умолчанию; свой дамп просто кладётся в `examples/`
+Мастер проходит через 5 этапов:
+1. **Выбор базы** — список `.sql` файлов в `examples/`
 2. **Сканирование** — сбор ВСЕХ уникальных значений каждого поля
-3. **Классификация полей** — автодетект типов (name/email/phone/genre...) по первым 50 значениям (параметр `SAMPLES_PER_FIELD`)
+3. **Классификация полей** — автодетект типов по первым 50 значениям (`SAMPLES_PER_FIELD`)
 4. **Загрузка маппингов** — LLM вызывается чанками (по 20 значений), результаты мержатся в единый словарь
 5. **Обработка** — потоковая замена по словарю O(1)
+
+*Зачем все значения? Для LLM маппинга — нужно знать ВСЕ уникальные значения, чтобы сгенерировать замену для каждого. 50 нужны только для автодетекта типа поля.*
 
 ### Пакетный режим (для CI/CD)
 ```bash
@@ -220,60 +222,47 @@ LLM вызывается чанками (по 20 значений). Пример
 
 **Где применять:** `Customer.FirstName`, `Employee.FirstName`, `Artist.Name`
 
-**Формат запроса к LLM:**
+**System Prompt:**
 ```
-SYSTEM PROMPT:
-"You are a professional data anonymization expert. Generate realistic anonymized replacements for each name provided. All output must be valid JSON only, no explanation text."
+You are a data anonymization expert. 
+Preserve the same ALPHABET (Latin stays Latin, Cyrillic stays Cyrillic). 
+Keep name length similar (±30%). 
+Match the case pattern (first letters capitalized). 
+Output valid JSON only.
+```
 
-USER PROMPT:
+**User Prompt:**
+```
 Field: {field_key}
 Description: {description}
-Original values ({count} total):
-"{name1}", "{name2}", "{name3}"...
 
-Replace each of these names with a realistic, culturally appropriate alternative name.
-Return a JSON object where keys are the original names and values are the new names.
-Example: {"John Smith": "James Anderson", "Jane Doe": "Sarah Williams"}
-
-Parameters:
-- max_tokens: 32768 (env: LLM_MAX_COMPLETION_TOKENS)
-- temperature: 0.3
-- response_format: {"type": "json_object"}
-- chunk_size: ≤20 значений на вызов + авто-деление пополам при пустом ответе
+Replace each name with a realistic alternative.
+- Keep same alphabet (Cyrillic→Cyrillic, Latin→Latin)
+- Keep similar length (±30% OK)
+- Preserve case pattern
+- Return JSON: {"original": "replacement", ...}
+Example: {"John Smith": "James Anderson", "Иван Петров": "Алексей Сидоров"}
 ```
 
 ### `CompanyTransformer` (company)
 
-Названия организаций масштаба региона оригинала.
+Названия организаций.
 
-**Где применять:** `Customer.Company`
-
-**Формат запроса к LLM:**
+**System Prompt:**
 ```
-USER PROMPT:
-Field: {field_key}
-Replace each company name with a realistic alternative company name.
-Return JSON: {"original_company": "new_company", ...}
-Original values ({count} total): "{company1}", "{company2}", "{company3}"...
+You are a data anonymization expert. 
+Preserve alphabet and case pattern. Keep length similar. Output valid JSON only.
 ```
 
 ### `AddressTransformer` (address)
 
-Новые улицы/дома/город, сохраняющие структуру адреса.
+Новые улицы/дома/город, сохраняющие структуру.
 
-**Где применять:** `Customer.Address`, `Employee.Address`, `Invoice.BillingAddress`
-
-**Формат запроса к LLM:**
+**System Prompt:**
 ```
-USER PROMPT:
-Field: {field_key}
-Replace each address with a realistic alternative address.
-Preserve the general structure but change street names, cities, etc.
-Return JSON: {"original": "new", ...}
-Addresses:
-- "{address1}"
-- "{address2}"
-- "{address3}"...
+You are a data anonymization expert. 
+Preserve address structure: same number of parts, same separators, same case pattern. 
+Output valid JSON only.
 ```
 
 ### `ComposerTransformer` (composer)
@@ -282,15 +271,12 @@ Addresses:
 
 ### `TitleTransformer` (title)
 
-Должности/роли (Sales Representative, CFO, Director).
+Должности/роли.
 
-**Формат запроса к LLM:**
+**System Prompt:**
 ```
-USER PROMPT:
-Field: {field_key}
-Replace each job title with another realistic job title at a similar level.
-Return JSON: {"original_title": "new_title", ...}
-Titles: "{title1}", "{title2}", "{title3}"...
+You are a data anonymization expert. 
+Preserve alphabet and case pattern. Keep length similar. Output valid JSON only.
 ```
 
 ---

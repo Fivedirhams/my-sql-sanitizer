@@ -34,11 +34,11 @@ services:
       - ./my_dump.sql:/input/dump.sql:ro        # Your custom dump (optional, replace name)
 
     environment:
-      # Kodik Router API (from .env file)
-      - KODIK_API_KEY=${KODIK_API_KEY:-REDACTED_LEAKED_KEY}
+      # Kodik Router API — берётся из .env рядом с docker-compose.yml (без дефолта!)
+      - KODIK_API_KEY=${KODIK_API_KEY:-}
       - LLM_ENDPOINT=${LLM_ENDPOINT:-https://api.kodikrouter.ru/v1}
       - LLM_MODEL=${LLM_MODEL:-qwen/qwen3.7-flash}
-      - MAX_TOKENS=${MAX_TOKENS:-4096}
+      - MAX_TOKENS=${MAX_TOKENS:-32768}
       - BATCH_SIZE=${BATCH_SIZE:-20}
 
     # Resource constraints
